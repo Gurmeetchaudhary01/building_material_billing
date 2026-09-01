@@ -1,0 +1,19 @@
+name: unified_esc_pos_printer_example
+description: Example app for the unified_esc_pos_printer package.
+publish_to: "none"
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+  flutter: ">=3.10.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  unified_esc_pos_printer:
+    path: ../
+  image: ^4.8.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/flutter_bnw.png

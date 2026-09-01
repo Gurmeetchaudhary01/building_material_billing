@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "104922924776",
+    "project_id": "gurmeet-building-material",
+    "storage_bucket": "gurmeet-building-material.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:104922924776:android:6e597227b92468aa65ab5d",
+        "android_client_info": {
+          "package_name": "com.gurmeet.buildingmaterialbilling.building_material_billing"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDWsD7X5-qDTOfgGX3SCXVraGhj866S1kg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

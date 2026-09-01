@@ -1,0 +1,79 @@
+## 3.4.0
+
+- Fix `PrintColumn(style: PrintTextStyle(bold: true))` being ignored inside `ticket.row()` ([#23](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/23)). Style was already emitted, but many clone printers ignore mid-line `ESC E` after absolute positioning (`ESC $`). Bold columns now reinforce emphasis with a CR overstrike; mode flags in `setStyles` are emitted after font/size.
+- Fix garbled characters on large BLE jobs (e.g. full demos with multilingual `textRaster`). `BleConnector` paces writes on the Dart side (default 128-byte chunks at ~6 KB/s) and sends `ESC @` on connect. Tune via `BleConnector(chunkSize:, bytesPerSecond:, interChunkDelay:)`.
+- Fix truncated prints when `disconnect()` is called right after `printTicket()` ([#17](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/17)). On Bluetooth Classic, BLE write-without-response, and USB serial, a completed write only means the data reached an OS/stack buffer; closing the link immediately discarded whatever was still queued. `disconnect()` now waits for that buffer to drain before tearing the connection down, so no caller-side delay is needed anymore.
+- Add `PrinterManager.waitWriteComplete()` (also available on every connector) for an explicit write barrier without disconnecting. The drain time is estimated from the amount of data written and a conservative link throughput; when a write was flow-controlled, the real throughput is measured from the write duration instead. Tunable per connector via `BluetoothConnector(drainBytesPerSecond:, maxDrainWait:)` and `BleConnector(writeWithoutResponseDrainDelay:)`.
+- Add Swift Package Manager (SPM) support for iOS. The plugin now ships with a `Package.swift` manifest alongside the existing CocoaPods podspec. SPM is used automatically on Flutter 3.44+ (or opt in earlier via `flutter config --enable-swift-package-manager`); CocoaPods continues to work unchanged. No source code changes, the same Swift files are shared between both systems.
+- Fix a native crash (`abort() has been called`) during BLE scanning on Windows. The advertisement handler blocked on a WinRT async call to resolve device names, which aborts the process when the event is delivered on an STA thread; it also read the advertisement payload without a null check and `watcher.Start()` could throw uncaught. Name resolution now runs on a worker thread (devices appear immediately with the address as a placeholder and the name upgrades once resolved), the handler no longer lets exceptions escape, and scan start failures surface as a `PrinterScanException` instead of crashing.
+- Compile on web. Browsers expose no raw TCP, SPP, or USB access, so no connection type is functional there, but multi-platform apps that target web alongside mobile/desktop can now share code: `scanPrinters()` finds no devices and `connect()` throws `PrinterConnectionException` on web.
+- Widen dependency constraints: `network_info_plus` now allows 8.x (`>=7.0.0 <9.0.0`) and `libserialport_plus` allows 1.x (`>=0.1.1 <2.0.0`, resolved per the consumer's SDK; 1.x needs Dart 3.10+).
+- Migrate the Android build to Flutter's built-in Kotlin support (AGP 9+ / Flutter 3.44+), keeping compatibility with older versions via a conditional Kotlin plugin apply.
+- Fix concurrent print jobs interrupting each other ([#21](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/21)). `PrinterManager` now serializes its operations, so a `connect()` issued while another job is printing waits for that job instead of disconnecting mid-print, and `connect()` to the already-connected device is a no-op. Print jobs are handed to the platform as a single atomic write; the native side still chunks and paces the transfer (BLE via `chunkSize` / `bytesPerSecond`; Bluetooth Classic in `chunkSize` blocks with a small `interChunkDelay` so slow printer modules are not overflowed by large jobs). On Android, the Bluetooth Classic, BLE, and USB printer-class connections are now shared process-wide with lease counting and serialized native operations, so background isolates (e.g. notification handlers) reuse the live connection and queue behind an in-progress job instead of tearing it down; connecting to a different printer while another isolate holds the connection fails with `PRINTER_BUSY`.
+
+## 3.3.3
+
+- Fix iOS (and other platforms without USB support) throwing `PrinterConnectionException: USB printing is not supported on this platform` during a combined printer scan ([#14](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/14)). The stub USB connector threw synchronously from `scan()`, so any `scanPrinters()` / `scanAll()` that included USB (which the default set does) failed on iOS even when the caller only wanted network, BLE, or Bluetooth printers. USB `scan()` on unsupported platforms now yields no devices instead of throwing. `connect()` and `writeBytes()` still throw there, since explicitly using a USB printer on such a platform is a genuine error.
+
+## 3.3.2
+
+- Allow Bluetooth scan/connect from a background isolate (e.g. a Firebase Messaging background handler or WorkManager) when the required permissions were already granted in a prior foreground session ([#12](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/12)). The native permission handler previously returned `false` whenever no `Activity` was attached, which is always the case in a background isolate, so every `scan()`/`connect()` threw a permission error even though the OS permissions were granted. It now checks already-granted permissions against the application context (which needs no `Activity`) and only requires an `Activity` to _prompt_ for missing ones. Background isolates still cannot show a permission prompt, and Bluetooth discovery remains unreliable there, so connect to a known device by address rather than scanning.
+
+## 3.3.1
+
+- Fix `Ticket.row()` / `Generator.row()` printing each column on its own line on many generic ESC/POS printers ([#10](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/10)). Each column was preceded by its own `ESC a` (select justification) command. Per the ESC/POS specification `ESC a` is only honoured at the beginning of a line, and many clone printers respond to a mid-line `ESC a` by flushing the buffered line and feeding — pushing every column onto a separate line. Column alignment is already achieved by the absolute print position (`ESC $`), so `ESC a` is now emitted only once per row (left justification, at the start of the line) and never per column. Output is unchanged on printers that previously rendered rows correctly.
+
+## 3.3.0
+
+- Add native Android support for USB Printer Class (interface class `0x07`) devices ([#5](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/5), [#8](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/8)). Most generic ESC/POS thermal printers expose this class instead of a CDC / serial chip and previously failed with `Not an Serial device` from the `usb_serial` package. The connector now probes each device's USB interface classes and routes Printer Class devices through a new native `UsbManager` + `bulkTransfer` path while keeping the existing `usb_serial` path for CDC / Virtual COM devices (FTDI, CP210x, PL2303, CH34x, USB CDC ACM). The user sees a one-time Android USB permission dialog on first connect to a Printer Class device.
+
+## 3.2.1
+
+- Remove hardcoded permissions from the package's Android manifest. The library no longer declares `BLUETOOTH`, `BLUETOOTH_ADMIN`, `BLUETOOTH_SCAN`, `BLUETOOTH_CONNECT`, `ACCESS_FINE_LOCATION`, or `ACCESS_COARSE_LOCATION` — these previously included `maxSdkVersion="30"` on the location entries, which the Android manifest merger propagated into consuming apps and broke apps that need location permissions on API 31+ for other features (maps, geolocation, etc.). Consumers must now declare the permissions they need in their own `AndroidManifest.xml`; see the updated "Android Setup" section in the README for the recommended permission set.
+
+## 3.2.0
+
+- Migrate USB serial dependency from `flutter_libserialport` to `libserialport_plus` to fix Android 16KB page size compatibility ([#3](https://github.com/elrizwiraswara/unified_esc_pos_printer/pull/3))
+
+## 3.1.0
+
+- Add `PrintRasterColumn` class for Flutter `TextStyle`-based column definitions
+- Add `Ticket.rowRaster()` method for raster-rendered table rows with full Flutter text styling, multilingual support, and RTL text direction
+- Update example app with Raster Row & Columns demo
+
+## 3.0.1
+
+- Fix iOS BLE scan stream handler by using explicit `BleScanStreamHandler` when setting the stream handler for the BLE scan event channel ([#1](https://github.com/elrizwiraswara/unified_esc_pos_printer/issues/1))
+
+## 3.0.0
+
+- BREAKING: Rename `TextStyles` to `PrintTextStyle`
+- BREAKING: Rename `styles` parameter to `style` in ticket/generator APIs and `PrintColumn`
+- BREAKING: Rename `textStyle` to `style` in `Ticket.textRaster(...)` and `renderTextLinesAsImages(...)`
+- Update README and example app to use the new names
+
+## 2.0.0
+
+- BREAKING: Remove `align` from `TextStyles`
+- Add explicit `align` parameter to `Ticket.text(...)` and `Ticket.textEncoded(...)`
+- Add `PrintColumn.align` for row/column alignment
+- Update `Generator` alignment flow to use explicit alignment parameters
+- Update `README.md` and example app usage to the new alignment API
+
+## 1.0.3
+
+- Rename `spaceBetweenRows` to `columnGap` for clarity
+- Only apply `columnGap` between columns, not after the last column
+- Change default `columnGap` from 5 to 1
+
+## 1.0.2
+
+- Improved Pub Score
+
+## 1.0.1
+
+- Update README.md.
+
+## 1.0.0
+
+- Initial release.
