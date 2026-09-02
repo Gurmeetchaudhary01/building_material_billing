@@ -21,9 +21,8 @@ import 'package:sqflite/sqflite.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:unified_esc_pos_printer/unified_esc_pos_printer.dart'
 as unified;
-import 'package:http/http.dart' as http;
 import 'web_browser_stub.dart'
-    if (dart.library.html) 'web_browser_web.dart' as browser;
+if (dart.library.html) 'web_browser_web.dart' as browser;
 
 void main() async {
 WidgetsFlutterBinding.ensureInitialized();
@@ -57,7 +56,7 @@ await AppDatabase.init();
 
 await loadBillsFromDatabase();
 await loadProductCatalog();
-
+await loadExpensesFromStorage();
 await CloudSync.setupListeners();
 await CloudSync.syncAll();
 
@@ -112,7 +111,7 @@ business.collection('bills');
 static CollectionReference<Map<String, dynamic>> get products =>
 business.collection('products');
 static CollectionReference<Map<String, dynamic>> get expenses =>
-    business.collection('expenses');
+business.collection('expenses');
 static StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _billsListener;
 static StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _productsListener;
 static StreamSubscription<QuerySnapshot<Map<String, dynamic>>>? _expensesListener;
@@ -193,16 +192,16 @@ syncStatusNotifier.value = SyncStatus.error;
 },
 );
 _expensesListener = expenses.snapshots(includeMetadataChanges: true).listen(
-      (snapshot) {
-    _expenseQueue = _expenseQueue.then(
-          (_) => _mergeExpenses(snapshot.docs),
-    ).catchError((_) {
-      syncStatusNotifier.value = SyncStatus.error;
-    });
-  },
-  onError: (_) {
-    syncStatusNotifier.value = SyncStatus.error;
-  },
+(snapshot) {
+_expenseQueue = _expenseQueue.then(
+(_) => _mergeExpenses(snapshot.docs),
+).catchError((_) {
+syncStatusNotifier.value = SyncStatus.error;
+});
+},
+onError: (_) {
+syncStatusNotifier.value = SyncStatus.error;
+},
 );
 }
 
@@ -246,7 +245,7 @@ await _enqueueProductMerge(productSnapshot.docs);
 final expenseSnapshot = await expenses.get();
 
 await _expenseQueue.then(
-      (_) => _mergeExpenses(expenseSnapshot.docs),
+(_) => _mergeExpenses(expenseSnapshot.docs),
 );
 syncStatusNotifier.value = SyncStatus.idle;
 } catch (_) {
@@ -335,38 +334,62 @@ syncStatusNotifier.value = SyncStatus.idle;
 static Future<void> _writeBill(Bill bill) async {
 await bills.doc(bill.id).set(bill.toJson());
 }
-  static Future<void> _writeExpense(Expense expense) async {
-    await expenses.doc(expense.id).set(expense.toMap());
-  }
-  static Future<void> _mergeExpenses(
-      List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
-      ) async {
-    for (final doc in docs) {
-      try {
-        final expense = Expense.fromMap(
-          Map<String, dynamic>.from(doc.data()),
-        );
+static Future<void> _writeExpense(Expense expense) async {
+if (expense.id.isEmpty) return;
 
-        final index = savedExpenses.indexWhere(
-              (e) => e.id == expense.id,
-        );
+await expenses.doc(expense.id).set(
+expense.toMap(),
+SetOptions(merge: true),
+);
+}
 
-        if (index >= 0) {
-          savedExpenses[index] = expense;
-        } else {
-          savedExpenses.add(expense);
-        }
-      } catch (_) {
-        continue;
-      }
-    }
+static Future<void> deleteExpense(String expenseId) async {
+if (expenseId.isEmpty) return;
 
-    savedExpenses.sort(
-          (a, b) => b.date.compareTo(a.date),
-    );
+await expenses.doc(expenseId).delete();
+}
 
-    notifyDataChanged();
-  }
+static Future<void> _mergeExpenses(
+List<QueryDocumentSnapshot<Map<String, dynamic>>> docs,
+) async {
+for (final doc in docs) {
+try {
+final expense = Expense.fromMap(
+Map<String, dynamic>.from(doc.data()),
+);
+
+final index = savedExpenses.indexWhere(
+(e) => e.id == expense.id,
+);
+
+if (index >= 0) {
+final local = savedExpenses[index];
+
+// Cloud newer -> use cloud version.
+if (expense.updatedAt.isAfter(local.updatedAt)) {
+savedExpenses[index] = expense;
+}
+// Local newer -> upload local version.
+else if (local.updatedAt.isAfter(expense.updatedAt)) {
+await _writeExpense(local);
+}
+} else {
+// New cloud expense.
+savedExpenses.add(expense);
+}
+} catch (_) {
+continue;
+}
+}
+
+savedExpenses.sort(
+(a, b) => b.date.compareTo(a.date),
+);
+
+await saveExpensesToStorage();
+
+notifyDataChanged();
+}
 static Future<void> saveBill(Bill bill) async {
 final now = DateTime.now().millisecondsSinceEpoch;
 final updated = bill.copyWith(
@@ -395,46 +418,51 @@ syncStatusNotifier.value = SyncStatus.error;
 }
 }
 
-  static Future<void> saveExpense(Expense expense) async {
-    final now = DateTime.now();
+static Future<void> saveExpense(Expense expense) async {
+final now = DateTime.now();
 
-    final updated = Expense(
-      id: expense.id.isEmpty
-          ? _newSyncId('expense')
-          : expense.id,
-      title: expense.title,
-      category: expense.category,
-      amount: expense.amount,
-      date: expense.date,
-      createdAt: expense.createdAt,
-      updatedAt: now,
-    );
+final updated = Expense(
+id: expense.id.isEmpty
+? _newSyncId('expense')
+    : expense.id,
+title: expense.title,
+category: expense.category,
+amount: expense.amount,
+date: expense.date,
+createdAt: expense.createdAt,
+updatedAt: now,
+);
 
-    final index = savedExpenses.indexWhere(
-          (e) => e.id == updated.id,
-    );
+final index = savedExpenses.indexWhere(
+(e) => e.id == updated.id,
+);
 
-    if (index >= 0) {
-      savedExpenses[index] = updated;
-    } else {
-      savedExpenses.add(updated);
-    }
+if (index >= 0) {
+savedExpenses[index] = updated;
+} else {
+savedExpenses.add(updated);
+}
 
-    savedExpenses.sort(
-          (a, b) => b.date.compareTo(a.date),
-    );
+savedExpenses.sort(
+(a, b) => b.date.compareTo(a.date),
+);
 
-    notifyDataChanged();
+// ALWAYS save locally first.
+await saveExpensesToStorage();
 
-    if (!available) return;
+notifyDataChanged();
 
-    try {
-      await _writeExpense(updated);
-      syncStatusNotifier.value = SyncStatus.idle;
-    } catch (_) {
-      syncStatusNotifier.value = SyncStatus.error;
-    }
-  }
+// Then sync to Firestore.
+if (!available) return;
+
+try {
+await _writeExpense(updated);
+syncStatusNotifier.value = SyncStatus.idle;
+} catch (_) {
+// Firestore will retry when connection returns.
+syncStatusNotifier.value = SyncStatus.error;
+}
+}
 static Future<void> deleteBill(int number) async {
 final local = await AppDatabase.getBillByNumber(number);
 if (local == null) return;
@@ -723,10 +751,10 @@ await db.execute(
 }
 
 
-  if (oldVersion < 5) {
-    await db.execute(
+if (oldVersion < 5) {
+await db.execute(
 "ALTER TABLE bills ADD COLUMN discount REAL NOT NULL DEFAULT 0",
-   );
+);
 }
 },
 );
@@ -974,7 +1002,7 @@ deletedAtMs:
 printCustomerDetails:
 (row['print_customer_details'] as num?)?.toInt() == 1,
 discount:
-    (row['discount'] as num?)?.toDouble() ?? 0,
+(row['discount'] as num?)?.toDouble() ?? 0,
 );
 }
 
@@ -1051,16 +1079,16 @@ int? createdAtMs,
 int? updatedAtMs,
 this.deviceId = '',
 this.deleted = false,
-  this.printCustomerDetails = false,
-  this.discount = 0,
-  this.deletedAtMs,
+this.printCustomerDetails = false,
+this.discount = 0,
+this.deletedAtMs,
 })  : id = (id == null || id.isEmpty) ? _newSyncId('bill') : id,
 createdAtMs = createdAtMs ?? DateTime.now().millisecondsSinceEpoch,
 updatedAtMs = updatedAtMs ?? DateTime.now().millisecondsSinceEpoch;
 
 double get subtotal => items.fold(
-  0,
-      (sum, item) => sum + item.amount,
+0,
+(sum, item) => sum + item.amount,
 );
 
 double get total => max(0, subtotal - discount);
@@ -1076,9 +1104,9 @@ int? createdAtMs,
 int? updatedAtMs,
 String? deviceId,
 bool? deleted,
-  bool? printCustomerDetails,
-  double? discount,
-  int? deletedAtMs,
+bool? printCustomerDetails,
+double? discount,
+int? deletedAtMs,
 }) =>
 Bill(
 id: id ?? this.id,
@@ -1092,7 +1120,7 @@ updatedAtMs: updatedAtMs ?? this.updatedAtMs,
 deviceId: deviceId ?? this.deviceId,
 deleted: deleted ?? this.deleted,
 printCustomerDetails: printCustomerDetails ?? this.printCustomerDetails,
-  discount: discount ?? this.discount,
+discount: discount ?? this.discount,
 deletedAtMs: deletedAtMs ?? this.deletedAtMs,
 );
 
@@ -1107,9 +1135,9 @@ Map<String, dynamic> toJson() => {
 'updatedAtMs': updatedAtMs,
 'deviceId': deviceId,
 'deleted': deleted,
-  'printCustomerDetails': printCustomerDetails,
-  'discount': discount,
-  'deletedAtMs': deletedAtMs,
+'printCustomerDetails': printCustomerDetails,
+'discount': discount,
+'deletedAtMs': deletedAtMs,
 };
 
 factory Bill.fromJson(
@@ -1140,53 +1168,53 @@ updatedAtMs:
 deviceId: json['deviceId']?.toString() ?? '',
 deleted: json['deleted'] == true,
 printCustomerDetails: json['printCustomerDetails'] == true,
-  discount: (json['discount'] as num?)?.toDouble() ?? 0,
+discount: (json['discount'] as num?)?.toDouble() ?? 0,
 deletedAtMs: (json['deletedAtMs'] as num?)?.toInt(),
 );
 }
 
 class Expense {
-  final String id;
-  final String title;
-  final String category;
-  final double amount;
-  final DateTime date;
-  final DateTime createdAt;
-  final DateTime updatedAt;
+final String id;
+final String title;
+final String category;
+final double amount;
+final DateTime date;
+final DateTime createdAt;
+final DateTime updatedAt;
 
-  Expense({
-    required this.id,
-    required this.title,
-    required this.category,
-    required this.amount,
-    required this.date,
-    required this.createdAt,
-    required this.updatedAt,
-  });
+Expense({
+required this.id,
+required this.title,
+required this.category,
+required this.amount,
+required this.date,
+required this.createdAt,
+required this.updatedAt,
+});
 
-  Map<String, dynamic> toMap() {
-    return {
-      'id': id,
-      'title': title,
-      'category': category,
-      'amount': amount,
-      'date': date.toIso8601String(),
-      'createdAt': createdAt.toIso8601String(),
-      'updatedAt': updatedAt.toIso8601String(),
-    };
-  }
+Map<String, dynamic> toMap() {
+return {
+'id': id,
+'title': title,
+'category': category,
+'amount': amount,
+'date': date.toIso8601String(),
+'createdAt': createdAt.toIso8601String(),
+'updatedAt': updatedAt.toIso8601String(),
+};
+}
 
-  factory Expense.fromMap(Map<String, dynamic> map) {
-    return Expense(
-      id: map['id']?.toString() ?? '',
-      title: map['title']?.toString() ?? '',
-      category: map['category']?.toString() ?? '',
-      amount: (map['amount'] as num?)?.toDouble() ?? 0,
-      date: DateTime.parse(map['date'].toString()),
-      createdAt: DateTime.parse(map['createdAt'].toString()),
-      updatedAt: DateTime.parse(map['updatedAt'].toString()),
-    );
-  }
+factory Expense.fromMap(Map<String, dynamic> map) {
+return Expense(
+id: map['id']?.toString() ?? '',
+title: map['title']?.toString() ?? '',
+category: map['category']?.toString() ?? '',
+amount: (map['amount'] as num?)?.toDouble() ?? 0,
+date: DateTime.parse(map['date'].toString()),
+createdAt: DateTime.parse(map['createdAt'].toString()),
+updatedAt: DateTime.parse(map['updatedAt'].toString()),
+);
+}
 }
 
 class Product {
@@ -1474,7 +1502,53 @@ dataRevisionNotifier.value++;
 final List<Bill> savedBills = [];
 int nextBillNumber = 1;
 final List<Expense> savedExpenses = [];
+const String _expensesLocalKey =
+'gurmeet_building_material_expenses';
 
+Future<void> loadExpensesFromStorage() async {
+final prefs = await SharedPreferences.getInstance();
+final raw = prefs.getString(_expensesLocalKey);
+
+if (raw == null || raw.isEmpty) {
+savedExpenses.clear();
+notifyDataChanged();
+return;
+}
+
+try {
+final decoded = jsonDecode(raw) as List<dynamic>;
+
+savedExpenses
+..clear()
+..addAll(
+decoded.map(
+(e) => Expense.fromMap(
+Map<String, dynamic>.from(e as Map),
+),
+),
+);
+
+savedExpenses.sort(
+(a, b) => b.date.compareTo(a.date),
+);
+
+notifyDataChanged();
+} catch (_) {
+savedExpenses.clear();
+notifyDataChanged();
+}
+}
+
+Future<void> saveExpensesToStorage() async {
+final prefs = await SharedPreferences.getInstance();
+
+await prefs.setString(
+_expensesLocalKey,
+jsonEncode(
+savedExpenses.map((e) => e.toMap()).toList(),
+),
+);
+}
 Future<void> loadBillsFromDatabase() async {
 final bills = await AppDatabase.getAllBills();
 savedBills
@@ -1488,812 +1562,795 @@ notifyDataChanged();
 
 // ======================== PDF BILL GENERATION =======================
 Future<pw.Font?> _loadRupeeFontSafely() async {
-  try {
-    final fontData = await rootBundle.load('assets/fonts/NotoSans-Regular.ttf');
-    return pw.Font.ttf(fontData.buffer.asByteData());
-  } catch (_) {
-    // Printing/sharing must still work if the optional font asset is absent.
-    return null;
-  }
+try {
+final fontData = await rootBundle.load('assets/fonts/NotoSans-Regular.ttf');
+return pw.Font.ttf(fontData.buffer.asByteData());
+} catch (_) {
+// Printing/sharing must still work if the optional font asset is absent.
+return null;
+}
 }
 
 String _moneyText(double value, pw.Font? rupeeFont) {
-  final amount = value.toStringAsFixed(2);
-  return rupeeFont == null ? 'Rs. $amount' : '₹$amount';
+final amount = value.toStringAsFixed(2);
+return rupeeFont == null ? 'Rs. $amount' : '₹$amount';
 }
 
 pw.TextStyle _moneyStyle({
-  pw.Font? font,
-  double fontSize = 9,
-  bool bold = false,
+pw.Font? font,
+double fontSize = 9,
+bool bold = false,
 }) {
-  return pw.TextStyle(
-    font: font,
-    fontSize: fontSize,
-    fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
-  );
+return pw.TextStyle(
+font: font,
+fontSize: fontSize,
+fontWeight: bold ? pw.FontWeight.bold : pw.FontWeight.normal,
+);
 }
 
 // ======================== PDF BILL GENERATION =======================
 Future<List<int>> buildBillPdf(Bill bill) async {
-  final pdf = pw.Document();
-  final rupeeFont = await _loadRupeeFontSafely();
+final pdf = pw.Document();
+final rupeeFont = await _loadRupeeFontSafely();
 
-  pdf.addPage(
-    pw.MultiPage(
-      pageFormat: PdfPageFormat.a4,
-      margin: const pw.EdgeInsets.all(28),
-      build: (pw.Context context) {
-        return <pw.Widget>[
-          pw.Column(
-            crossAxisAlignment: pw.CrossAxisAlignment.stretch,
-            children: [
-              pw.Center(
-                child: pw.Text(
-                  businessName,
-                  style: pw.TextStyle(
-                    fontSize: 20,
-                    fontWeight: pw.FontWeight.bold,
-                  ),
-                ),
-              ),
-              pw.SizedBox(height: 3),
-              pw.Center(
-                child: pw.Text(
-                  businessAddress1,
-                  style: const pw.TextStyle(fontSize: 11),
-                ),
-              ),
-              pw.Center(
-                child: pw.Text(
-                  businessAddress2,
-                  style: const pw.TextStyle(fontSize: 11),
-                ),
-              ),
-              pw.SizedBox(height: 4),
-              pw.Center(
-                child: pw.Text(
-                  'GST No: $businessGST',
-                  style: const pw.TextStyle(fontSize: 10),
-                ),
-              ),
-              pw.Center(
-                child: pw.Text(
-                  'Contact: $businessContact',
-                  style: const pw.TextStyle(fontSize: 10),
-                ),
-              ),
-              pw.SizedBox(height: 10),
-              pw.Divider(),
-              pw.Center(
-                child: pw.Text(
-                  'BILL',
-                  style: pw.TextStyle(
-                    fontSize: 15,
-                    fontWeight: pw.FontWeight.bold,
-                  ),
-                ),
-              ),
-              pw.Divider(),
-              pw.SizedBox(height: 8),
-              pw.Row(
-                mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-                crossAxisAlignment: pw.CrossAxisAlignment.start,
-                children: [
-                  pw.Column(
-                    crossAxisAlignment: pw.CrossAxisAlignment.start,
-                    children: [
-                      pw.Text(
-                        'Bill No: ${bill.number}',
-                        style: pw.TextStyle(
-                          fontSize: 10,
-                          fontWeight: pw.FontWeight.bold,
-                        ),
-                      ),
-                      pw.SizedBox(height: 3),
-                      pw.Text(
-                        'Date: ${bill.date.day.toString().padLeft(2, '0')}/'
-                        '${bill.date.month.toString().padLeft(2, '0')}/'
-                        '${bill.date.year}',
-                        style: const pw.TextStyle(fontSize: 10),
-                      ),
-                    ],
-                  ),
-                  pw.Column(
-                    crossAxisAlignment: pw.CrossAxisAlignment.end,
-                    children: [
-                      if (bill.customerName.trim().isNotEmpty)
-                        pw.Text(
-                          'Customer: ${bill.customerName}',
-                          style: const pw.TextStyle(fontSize: 10),
-                        ),
-                      if (bill.customerMobile.trim().isNotEmpty)
-                        pw.Text(
-                          'Mobile: ${bill.customerMobile}',
-                          style: const pw.TextStyle(fontSize: 10),
-                        ),
-                    ],
-                  ),
-                ],
-              ),
-              pw.SizedBox(height: 15),
-            ],
-          ),
-          pw.Table(
-            border: pw.TableBorder.all(width: 0.5),
-            columnWidths: const {
-              0: pw.FlexColumnWidth(4.2),
-              1: pw.FlexColumnWidth(1.3),
-              2: pw.FlexColumnWidth(1.7),
-              3: pw.FlexColumnWidth(2.0),
-            },
-            children: [
-              pw.TableRow(
-                children: [
-                  for (final heading in ['Item', 'Qty', 'Rate', 'Amount'])
-                    pw.Padding(
-                      padding: const pw.EdgeInsets.all(6),
-                      child: pw.Text(
-                        heading,
-                        style: pw.TextStyle(
-                          fontSize: 9,
-                          fontWeight: pw.FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-              ...bill.items.map(
-                (item) => pw.TableRow(
-                  children: [
-                    pw.Padding(
-                      padding: const pw.EdgeInsets.all(6),
-                      child: pw.Text(
-                        item.name,
-                        style: const pw.TextStyle(fontSize: 9),
-                      ),
-                    ),
-                    pw.Padding(
-                      padding: const pw.EdgeInsets.all(6),
-                      child: pw.Text(
-                        '${item.quantity} ${item.unit}',
-                        style: const pw.TextStyle(fontSize: 9),
-                      ),
-                    ),
-                    pw.Padding(
-                      padding: const pw.EdgeInsets.all(6),
-                      child: pw.Text(
-                        _moneyText(item.rate, rupeeFont),
-                        style: _moneyStyle(font: rupeeFont),
-                      ),
-                    ),
-                    pw.Padding(
-                      padding: const pw.EdgeInsets.all(6),
-                      child: pw.Text(
-                        _moneyText(item.amount, rupeeFont),
-                        style: _moneyStyle(font: rupeeFont),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          pw.SizedBox(height: 15),
-          pw.Align(
-            alignment: pw.Alignment.centerRight,
-            child: pw.Column(
-              crossAxisAlignment: pw.CrossAxisAlignment.end,
-              children: [
-                pw.Text(
-                  'SUBTOTAL: ${_moneyText(bill.subtotal, rupeeFont)}',
-                  style: _moneyStyle(
-                    font: rupeeFont,
-                    fontSize: 11,
-                  ),
-                ),
-                if (bill.discount > 0)
-                  pw.Text(
-                    'DISCOUNT: -${_moneyText(bill.discount, rupeeFont)}',
-                    style: _moneyStyle(
-                      font: rupeeFont,
-                      fontSize: 11,
-                    ),
-                  ),
-                pw.SizedBox(height: 3),
-                pw.Text(
-                  'TOTAL: ${_moneyText(bill.total, rupeeFont)}',
-                  style: _moneyStyle(
-                    font: rupeeFont,
-                    fontSize: 13,
-                    bold: true,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          pw.SizedBox(height: 20),
-          pw.Center(
-            child: pw.Text(
-              'Thank you for shopping with us.',
-              style: const pw.TextStyle(fontSize: 9),
-            ),
-          ),
-        ];
-      },
-    ),
-  );
+pdf.addPage(
+pw.MultiPage(
+pageFormat: PdfPageFormat.a4,
+margin: const pw.EdgeInsets.all(28),
+build: (pw.Context context) {
+return <pw.Widget>[
+pw.Column(
+crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+children: [
+pw.Center(
+child: pw.Text(
+businessName,
+style: pw.TextStyle(
+fontSize: 20,
+fontWeight: pw.FontWeight.bold,
+),
+),
+),
+pw.SizedBox(height: 3),
+pw.Center(
+child: pw.Text(
+businessAddress1,
+style: const pw.TextStyle(fontSize: 11),
+),
+),
+pw.Center(
+child: pw.Text(
+businessAddress2,
+style: const pw.TextStyle(fontSize: 11),
+),
+),
+pw.SizedBox(height: 4),
+pw.Center(
+child: pw.Text(
+'GST No: $businessGST',
+style: const pw.TextStyle(fontSize: 10),
+),
+),
+pw.Center(
+child: pw.Text(
+'Contact: $businessContact',
+style: const pw.TextStyle(fontSize: 10),
+),
+),
+pw.SizedBox(height: 10),
+pw.Divider(),
+pw.Center(
+child: pw.Text(
+'BILL',
+style: pw.TextStyle(
+fontSize: 15,
+fontWeight: pw.FontWeight.bold,
+),
+),
+),
+pw.Divider(),
+pw.SizedBox(height: 8),
+pw.Row(
+mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
+crossAxisAlignment: pw.CrossAxisAlignment.start,
+children: [
+pw.Column(
+crossAxisAlignment: pw.CrossAxisAlignment.start,
+children: [
+pw.Text(
+'Bill No: ${bill.number}',
+style: pw.TextStyle(
+fontSize: 10,
+fontWeight: pw.FontWeight.bold,
+),
+),
+pw.SizedBox(height: 3),
+pw.Text(
+'Date: ${bill.date.day.toString().padLeft(2, '0')}/'
+'${bill.date.month.toString().padLeft(2, '0')}/'
+'${bill.date.year}',
+style: const pw.TextStyle(fontSize: 10),
+),
+],
+),
+pw.Column(
+crossAxisAlignment: pw.CrossAxisAlignment.end,
+children: [
+if (bill.customerName.trim().isNotEmpty)
+pw.Text(
+'Customer: ${bill.customerName}',
+style: const pw.TextStyle(fontSize: 10),
+),
+if (bill.customerMobile.trim().isNotEmpty)
+pw.Text(
+'Mobile: ${bill.customerMobile}',
+style: const pw.TextStyle(fontSize: 10),
+),
+],
+),
+],
+),
+pw.SizedBox(height: 15),
+],
+),
+pw.Table(
+border: pw.TableBorder.all(width: 0.5),
+columnWidths: const {
+0: pw.FlexColumnWidth(4.2),
+1: pw.FlexColumnWidth(1.3),
+2: pw.FlexColumnWidth(1.7),
+3: pw.FlexColumnWidth(2.0),
+},
+children: [
+pw.TableRow(
+children: [
+for (final heading in ['Item', 'Qty', 'Rate', 'Amount'])
+pw.Padding(
+padding: const pw.EdgeInsets.all(6),
+child: pw.Text(
+heading,
+style: pw.TextStyle(
+fontSize: 9,
+fontWeight: pw.FontWeight.bold,
+),
+),
+),
+],
+),
+...bill.items.map(
+(item) => pw.TableRow(
+children: [
+pw.Padding(
+padding: const pw.EdgeInsets.all(6),
+child: pw.Text(
+item.name,
+style: const pw.TextStyle(fontSize: 9),
+),
+),
+pw.Padding(
+padding: const pw.EdgeInsets.all(6),
+child: pw.Text(
+'${item.quantity} ${item.unit}',
+style: const pw.TextStyle(fontSize: 9),
+),
+),
+pw.Padding(
+padding: const pw.EdgeInsets.all(6),
+child: pw.Text(
+_moneyText(item.rate, rupeeFont),
+style: _moneyStyle(font: rupeeFont),
+),
+),
+pw.Padding(
+padding: const pw.EdgeInsets.all(6),
+child: pw.Text(
+_moneyText(item.amount, rupeeFont),
+style: _moneyStyle(font: rupeeFont),
+),
+),
+],
+),
+),
+],
+),
+pw.SizedBox(height: 15),
+pw.Align(
+alignment: pw.Alignment.centerRight,
+child: pw.Column(
+crossAxisAlignment: pw.CrossAxisAlignment.end,
+children: [
+pw.Text(
+'SUBTOTAL: ${_moneyText(bill.subtotal, rupeeFont)}',
+style: _moneyStyle(
+font: rupeeFont,
+fontSize: 11,
+),
+),
+if (bill.discount > 0)
+pw.Text(
+'DISCOUNT: -${_moneyText(bill.discount, rupeeFont)}',
+style: _moneyStyle(
+font: rupeeFont,
+fontSize: 11,
+),
+),
+pw.SizedBox(height: 3),
+pw.Text(
+'TOTAL: ${_moneyText(bill.total, rupeeFont)}',
+style: _moneyStyle(
+font: rupeeFont,
+fontSize: 13,
+bold: true,
+),
+),
+],
+),
+),
+pw.SizedBox(height: 20),
+pw.Center(
+child: pw.Text(
+'Thank you for shopping with us.',
+style: const pw.TextStyle(fontSize: 9),
+),
+),
+];
+},
+),
+);
 
-  return pdf.save();
+return pdf.save();
 }
 
-// ======================== THERMAL 58MM PRINT LAYOUT ========================
+// ======================== THERMAL 80MM PRINT LAYOUT ========================
 Future<void> print80mmBill(
-  BuildContext context,
-  Bill bill,
+BuildContext context,
+Bill bill,
 ) async {
-  try {
-    final rupeeFont = await _loadRupeeFontSafely();
-    final pdf = pw.Document();
-    const thermalPageFormat = PdfPageFormat(
-      80 * PdfPageFormat.mm,
-      200 * PdfPageFormat.mm,
-      marginLeft: 3 * PdfPageFormat.mm,
-      marginRight: 3 * PdfPageFormat.mm,
-      marginTop: 3 * PdfPageFormat.mm,
-      marginBottom: 3 * PdfPageFormat.mm,
-    );
+try {
+final rupeeFont = await _loadRupeeFontSafely();
+final pdf = pw.Document();
 
-    pdf.addPage(
-      pw.MultiPage(
-        pageFormat: thermalPageFormat,
-        margin: const pw.EdgeInsets.all(3 * PdfPageFormat.mm),
-        build: (pw.Context context) {
-          return [
-            pw.Center(
-              child: pw.Text(
-                businessName,
-                textAlign: pw.TextAlign.center,
-                style: pw.TextStyle(
-                  fontSize: 13,
-                  fontWeight: pw.FontWeight.bold,
-                ),
-              ),
-            ),
-            pw.Center(
-              child: pw.Text(
-                businessAddress1,
-                style: const pw.TextStyle(fontSize: 9),
-              ),
-            ),
-            pw.Center(
-              child: pw.Text(
-                businessAddress2,
-                style: const pw.TextStyle(fontSize: 9),
-              ),
-            ),
-            pw.Center(
-              child: pw.Text(
-                'GST No: $businessGST',
-                style: const pw.TextStyle(fontSize: 8),
-              ),
-            ),
-            pw.Center(
-              child: pw.Text(
-                'Contact: $businessContact',
-                style: const pw.TextStyle(fontSize: 8),
-              ),
-            ),
-            pw.SizedBox(height: 4),
-            pw.Divider(),
-            pw.Center(
-              child: pw.Text(
-                'BILL',
-                style: pw.TextStyle(
-                  fontSize: 11,
-                  fontWeight: pw.FontWeight.bold,
-                ),
-              ),
-            ),
-            pw.Divider(),
-            pw.Text(
-              'Bill No: ${bill.number}',
-              style: const pw.TextStyle(fontSize: 8),
-            ),
-            pw.Text(
-              'Date: ${bill.date.day.toString().padLeft(2, '0')}/'
-              '${bill.date.month.toString().padLeft(2, '0')}/'
-              '${bill.date.year}',
-              style: const pw.TextStyle(fontSize: 8),
-            ),
-            if (bill.printCustomerDetails && bill.customerName.trim().isNotEmpty)
-              pw.Text(
-                'Customer: ${bill.customerName}',
-                style: const pw.TextStyle(fontSize: 8),
-              ),
-            if (bill.printCustomerDetails && bill.customerMobile.trim().isNotEmpty)
-              pw.Text(
-                'Mobile: ${bill.customerMobile}',
-                style: const pw.TextStyle(fontSize: 8),
-              ),
-            pw.SizedBox(height: 4),
-            pw.Divider(),
-            pw.Row(
-              children: [
-                pw.Expanded(
-                  flex: 5,
-                  child: pw.Text(
-                    'Item',
-                    style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold),
-                  ),
-                ),
-                pw.Expanded(
-                  flex: 3,
-                  child: pw.Text(
-                    'Qty',
-                    textAlign: pw.TextAlign.right,
-                    style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold),
-                  ),
-                ),
-                pw.Expanded(
-                  flex: 3,
-                  child: pw.Text(
-                    'Rate',
-                    textAlign: pw.TextAlign.right,
-                    style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold),
-                  ),
-                ),
-                pw.Expanded(
-                  flex: 3,
-                  child: pw.Text(
-                    'Amount',
-                    textAlign: pw.TextAlign.right,
-                    style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold),
-                  ),
-                ),
-              ],
-            ),
-            pw.Divider(),
-            ...bill.items.map(
-              (item) => pw.Padding(
-                padding: const pw.EdgeInsets.symmetric(vertical: 2),
-                child: pw.Row(
-                  crossAxisAlignment: pw.CrossAxisAlignment.start,
-                  children: [
-                    pw.Expanded(
-                      flex: 5,
-                      child: pw.Text(
-                        item.name,
-                        maxLines: 3,
-                        style: const pw.TextStyle(fontSize: 8),
-                      ),
-                    ),
-                    pw.Expanded(
-                      flex: 3,
-                      child: pw.Text(
-                        '${item.quantity} ${item.unit}',
-                        textAlign: pw.TextAlign.right,
-                        style: const pw.TextStyle(fontSize: 8),
-                      ),
-                    ),
-                    pw.Expanded(
-                      flex: 3,
-                      child: pw.Text(
-                        _moneyText(item.rate, rupeeFont),
-                        textAlign: pw.TextAlign.right,
-                        style: _moneyStyle(font: rupeeFont, fontSize: 8),
-                      ),
-                    ),
-                    pw.Expanded(
-                      flex: 3,
-                      child: pw.Text(
-                        _moneyText(item.amount, rupeeFont),
-                        textAlign: pw.TextAlign.right,
-                        style: _moneyStyle(font: rupeeFont, fontSize: 8),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            pw.Divider(),
-            pw.Align(
-              alignment: pw.Alignment.centerRight,
-              child: pw.Column(
-                crossAxisAlignment: pw.CrossAxisAlignment.end,
-                children: [
-                  pw.Text(
-                    'SUBTOTAL: ${_moneyText(bill.subtotal, rupeeFont)}',
-                    style: _moneyStyle(
-                      font: rupeeFont,
-                      fontSize: 9,
-                    ),
-                  ),
-                  if (bill.discount > 0)
-                    pw.Text(
-                      'DISCOUNT: -${_moneyText(bill.discount, rupeeFont)}',
-                      style: _moneyStyle(
-                        font: rupeeFont,
-                        fontSize: 9,
-                      ),
-                    ),
-                  pw.SizedBox(height: 2),
-                  pw.Text(
-                    'TOTAL: ${_moneyText(bill.total, rupeeFont)}',
-                    style: _moneyStyle(
-                      font: rupeeFont,
-                      fontSize: 11,
-                      bold: true,
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            pw.SizedBox(height: 8),
-            pw.Center(
-              child: pw.Text(
-                'THANK YOU\nVISIT AGAIN',
-                textAlign: pw.TextAlign.center,
-                style: const pw.TextStyle(fontSize: 8),
-              ),
-            ),
-          ];
-        },
-      ),
-    );
-
-    final bytes = await pdf.save();
-    if (bytes.isEmpty) {
-      throw Exception('PDF generation returned empty data');
-    }
-
-
-    // iPhone/iPad Safari has a long-standing Flutter Web printing issue: 
-    // Printing.layoutPdf() can return successfully while showing no print UI.
-    // Open the generated PDF in a user-initiated tab on Safari instead.
-    // Safari then exposes its native PDF Share/Print controls reliably.
-    if (kIsWeb) {
-      final content = StringBuffer();
-
-      content.writeln('================================');
-      content.writeln('   $businessName');
-      content.writeln('   $businessAddress1');
-      content.writeln('   $businessAddress2');
-      content.writeln('GST No: $businessGST');
-      content.writeln('Contact: $businessContact');
-      content.writeln('================================');
-      content.writeln('             BILL');
-      content.writeln('================================');
-      content.writeln('Bill No: ${bill.number}');
-      content.writeln(
-        'Date: ${bill.date.day.toString().padLeft(2, '0')}/'
-            '${bill.date.month.toString().padLeft(2, '0')}/'
-            '${bill.date.year}',
-      );
-
-      if (bill.printCustomerDetails &&
-          bill.customerName.trim().isNotEmpty) {
-        content.writeln('Customer: ${bill.customerName}');
-      }
-
-      if (bill.printCustomerDetails &&
-          bill.customerMobile.trim().isNotEmpty) {
-        content.writeln('Mobile: ${bill.customerMobile}');
-      }
-
-      content.writeln('--------------------------------');
-      content.writeln('Item        Qty    Rate    Amt');
-      content.writeln('--------------------------------');
-
-      for (final item in bill.items) {
-        var itemName = item.name.trim();
-
-        if (itemName.length > 11) {
-          itemName = itemName.substring(0, 11);
-        }
-
-        final qty =
-        '${item.quantity.toStringAsFixed(0)} ${item.unit}'.trim();
-
-        final qtyText =
-        qty.length > 5 ? qty.substring(0, 5) : qty;
-
-        final rate = item.rate.toStringAsFixed(0);
-        final amount = item.amount.toStringAsFixed(0);
-
-        final line =
-            itemName.padRight(11) +
-                qtyText.padLeft(5) +
-                rate.padLeft(8) +
-                amount.padLeft(8);
-
-        content.writeln(line);
-      }
-
-      content.writeln('--------------------------------');
-
-      if (bill.discount > 0) {
-        content.writeln(
-          'SUBTOTAL: Rs.${bill.subtotal.toStringAsFixed(2)}',
-        );
-        content.writeln(
-          'DISCOUNT: -Rs.${bill.discount.toStringAsFixed(2)}',
-        );
-      }
-
-      content.writeln(
-        'TOTAL: Rs.${bill.total.toStringAsFixed(2)}',
-      );
-
-      content.writeln('');
-      content.writeln('          THANK YOU');
-      content.writeln('         VISIT AGAIN');
-      content.writeln('');
-      content.writeln('');
-      content.writeln('');
-
-      final response = await http.post(
-        Uri.parse('http://127.0.0.1:8765/print'),
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: jsonEncode({
-          'content': content.toString(),
-        }),
-      );
-
-      if (response.statusCode != 200) {
-        throw Exception(
-          'Print bridge error: ${response.body}',
-        );
-      }
-
-      final result =
-      jsonDecode(response.body) as Map<String, dynamic>;
-
-      if (result['success'] != true) {
-        throw Exception(
-          result['error']?.toString() ?? 'Printer failed',
-        );
-      }
-
-      if (context.mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Bill printer par send ho gaya'),
-          ),
-        );
-      }
-
-      return;
-    }
-    if (!kIsWeb) {
-      // ================= BLUETOOTH =================
-
-      final bluetoothConnected =
-      await BluetoothPrinterManager.isConnected();
-
-      if (bluetoothConnected) {
-        final printerBytes =
-        await buildBluetooth80mmBill(bill);
-
-        final success =
-        await PrintBluetoothThermal.writeBytes(
-          printerBytes,
-        );
-
-        if (!success) {
-          throw Exception(
-            'Bluetooth printer par print nahi hua',
-          );
-        }
-
-        return;
-      }
-
-      // ================= USB / OTG =================
-
-      if (UsbPrinterManager.isConnected) {
-        final printerBytes =
-        await buildBluetooth80mmBill(bill);
-
-        await UsbPrinterManager.printBytes(printerBytes);
-
-        return;
-      }
-    }
-
-
-    await Printing.layoutPdf(
-      name: 'Bill_${bill.number}_80mm',
-      format: thermalPageFormat,
-      dynamicLayout: false,
-      usePrinterSettings: false,
-      forceCustomPrintPaper: true,
-      onLayout: (format) async =>
-          Uint8List.fromList(bytes),
-    );
-  } catch (e) {
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Print error: $e'),
-        ),
-      );
-    }
-  }
+var itemLines = 0;
+for (final item in bill.items) {
+final nameLength = item.name.trim().length;
+itemLines += nameLength <= 24
+? 1
+    : ((nameLength / 24).ceil()).clamp(1, 2);
 }
+
+final customerLines = bill.printCustomerDetails
+? (bill.customerName.trim().isNotEmpty ? 1 : 0) +
+(bill.customerMobile.trim().isNotEmpty ? 1 : 0)
+    : 0;
+
+final calculatedHeight =
+85.0 + (itemLines * 7.0) + (customerLines * 5.0);
+
+final heightMm = calculatedHeight.clamp(85.0, 300.0).toDouble();
+
+final thermalPageFormat = PdfPageFormat(
+72 * PdfPageFormat.mm,
+heightMm * PdfPageFormat.mm,
+marginLeft: 0,
+marginRight: 0,
+marginTop: 0,
+marginBottom: 0,
+);
+
+pdf.addPage(
+pw.Page(
+pageFormat: thermalPageFormat,
+margin: const pw.EdgeInsets.only(
+top: 3 * PdfPageFormat.mm,
+bottom: 3 * PdfPageFormat.mm,
+),
+build: (pw.Context context) {
+return pw.Column(
+crossAxisAlignment: pw.CrossAxisAlignment.stretch,
+children: [
+pw.Center(
+child: pw.Text(
+businessName,
+textAlign: pw.TextAlign.center,
+maxLines: 1,
+style: pw.TextStyle(
+fontSize: 13,
+fontWeight: pw.FontWeight.bold,
+),
+),
+),
+pw.Center(
+child: pw.Text(
+businessAddress1,
+style: const pw.TextStyle(fontSize: 9),
+),
+),
+pw.Center(
+child: pw.Text(
+businessAddress2,
+style: const pw.TextStyle(fontSize: 9),
+),
+),
+pw.Center(
+child: pw.Text(
+'GST No: $businessGST',
+style: const pw.TextStyle(fontSize: 8),
+),
+),
+pw.Center(
+child: pw.Text(
+'Contact: $businessContact',
+style: const pw.TextStyle(fontSize: 8),
+),
+),
+pw.SizedBox(height: 3),
+pw.Divider(),
+
+pw.Center(
+child: pw.Text(
+'BILL',
+style: pw.TextStyle(
+fontSize: 11,
+fontWeight: pw.FontWeight.bold,
+),
+),
+),
+pw.Divider(),
+
+pw.Text(
+'Bill No: ${bill.number}',
+style: const pw.TextStyle(fontSize: 8),
+),
+pw.Text(
+'Date: '
+'${bill.date.day.toString().padLeft(2, '0')}/'
+'${bill.date.month.toString().padLeft(2, '0')}/'
+'${bill.date.year}',
+style: const pw.TextStyle(fontSize: 8),
+),
+
+if (bill.printCustomerDetails &&
+bill.customerName.trim().isNotEmpty)
+pw.Text(
+'Customer: ${bill.customerName}',
+maxLines: 1,
+style: const pw.TextStyle(fontSize: 8),
+),
+
+if (bill.printCustomerDetails &&
+bill.customerMobile.trim().isNotEmpty)
+pw.Text(
+'Mobile: ${bill.customerMobile}',
+maxLines: 1,
+style: const pw.TextStyle(fontSize: 8),
+),
+
+pw.SizedBox(height: 3),
+pw.Divider(),
+
+// ================= ITEM HEADER =================
+pw.Row(
+children: [
+pw.Expanded(
+flex: 5,
+child: pw.Text(
+'Item',
+style: pw.TextStyle(
+fontSize: 8,
+fontWeight: pw.FontWeight.bold,
+),
+),
+),
+pw.Expanded(
+flex: 2,
+child: pw.Text(
+'Qty',
+textAlign: pw.TextAlign.right,
+style: pw.TextStyle(
+fontSize: 8,
+fontWeight: pw.FontWeight.bold,
+),
+),
+),
+pw.Expanded(
+flex: 3,
+child: pw.Text(
+'Rate',
+textAlign: pw.TextAlign.right,
+style: pw.TextStyle(
+fontSize: 8,
+fontWeight: pw.FontWeight.bold,
+),
+),
+),
+pw.Expanded(
+flex: 4,
+child: pw.Padding(
+padding: const pw.EdgeInsets.only(
+right: 3 * PdfPageFormat.mm,
+),
+child: pw.Text(
+'Amount',
+textAlign: pw.TextAlign.right,
+style: pw.TextStyle(
+fontSize: 8,
+fontWeight: pw.FontWeight.bold,
+),
+),
+),
+),
+],
+),
+
+pw.Divider(),
+
+// ================= ITEMS =================
+...bill.items.map(
+(item) => pw.Padding(
+padding: const pw.EdgeInsets.symmetric(vertical: 2),
+child: pw.Row(
+crossAxisAlignment:
+pw.CrossAxisAlignment.start,
+children: [
+pw.Expanded(
+flex: 5,
+child: pw.Text(
+item.name,
+maxLines: 2,
+style: const pw.TextStyle(fontSize: 8),
+),
+),
+pw.Expanded(
+flex: 2,
+child: pw.Text(
+'${item.quantity} ${item.unit}',
+textAlign: pw.TextAlign.right,
+maxLines: 1,
+softWrap: false,
+style: const pw.TextStyle(fontSize: 8),
+),
+),
+pw.Expanded(
+flex: 3,
+child: pw.Text(
+item.rate.toStringAsFixed(2),
+textAlign: pw.TextAlign.right,
+maxLines: 1,
+softWrap: false,
+style: _moneyStyle(
+font: rupeeFont,
+fontSize: 8,
+),
+),
+),
+pw.Expanded(
+flex: 4,
+child: pw.Padding(
+padding: const pw.EdgeInsets.only(
+right: 3 * PdfPageFormat.mm,
+),
+child: pw.Text(
+item.amount.toStringAsFixed(2),
+textAlign: pw.TextAlign.right,
+maxLines: 1,
+softWrap: false,
+style: _moneyStyle(
+font: rupeeFont,
+fontSize: 8,
+bold: true,
+),
+),
+),
+),
+],
+),
+),
+),
+
+pw.Divider(),
+
+// ================= TOTALS =================
+pw.SizedBox(height: 3),
+
+pw.Row(
+children: [
+pw.Expanded(
+child: pw.Text(
+'SUBTOTAL:',
+textAlign: pw.TextAlign.right,
+style: const pw.TextStyle(fontSize: 9),
+),
+),
+pw.SizedBox(width: 3),
+pw.Text(
+_moneyText(bill.subtotal, rupeeFont),
+style: _moneyStyle(
+font: rupeeFont,
+fontSize: 9,
+bold: true,
+),
+),
+],
+),
+
+if (bill.discount > 0)
+pw.Row(
+children: [
+pw.Expanded(
+child: pw.Text(
+'DISCOUNT:',
+textAlign: pw.TextAlign.right,
+style: const pw.TextStyle(fontSize: 9),
+),
+),
+pw.SizedBox(width: 3),
+pw.Text(
+'-${_moneyText(bill.discount, rupeeFont)}',
+style: _moneyStyle(
+font: rupeeFont,
+fontSize: 9,
+),
+),
+],
+),
+
+pw.SizedBox(height: 2),
+
+pw.Row(
+children: [
+pw.Expanded(
+child: pw.Text(
+'TOTAL:',
+textAlign: pw.TextAlign.right,
+style: pw.TextStyle(
+fontSize: 10,
+fontWeight: pw.FontWeight.bold,
+),
+),
+),
+pw.SizedBox(width: 3),
+pw.Text(
+_moneyText(bill.total, rupeeFont),
+style: _moneyStyle(
+font: rupeeFont,
+fontSize: 10,
+bold: true,
+),
+),
+],
+),
+
+pw.SizedBox(height: 7),
+
+pw.Center(
+child: pw.Text(
+'THANK YOU\nVISIT AGAIN',
+textAlign: pw.TextAlign.center,
+style: const pw.TextStyle(fontSize: 8),
+),
+),
+],
+);
+},
+),
+);
+
+final bytes = await pdf.save();
+
+if (bytes.isEmpty) {
+throw Exception('PDF generation returned empty data');
+}
+
+if (!kIsWeb) {
+final bluetoothConnected =
+await BluetoothPrinterManager.isConnected();
+
+if (bluetoothConnected) {
+final printerBytes = await buildBluetooth80mmBill(bill);
+final success =
+await PrintBluetoothThermal.writeBytes(printerBytes);
+
+if (!success) {
+throw Exception('Bluetooth printer par print nahi hua');
+}
+return;
+}
+
+if (UsbPrinterManager.isConnected) {
+final printerBytes = await buildBluetooth80mmBill(bill);
+await UsbPrinterManager.printBytes(printerBytes);
+return;
+}
+}
+
+await Printing.layoutPdf(
+name: 'Bill_${bill.number}_80mm',
+format: thermalPageFormat,
+dynamicLayout: false,
+usePrinterSettings: false,
+forceCustomPrintPaper: true,
+onLayout: (format) async => Uint8List.fromList(bytes),
+);
+} catch (e) {
+if (context.mounted) {
+ScaffoldMessenger.of(context).showSnackBar(
+SnackBar(content: Text('Print error: $e')),
+);
+}
+}
+}
+
 // ============================================================
 // BLUETOOTH THERMAL PRINTER MANAGER
 // ============================================================
 
 class BluetoothPrinterManager {
-  static const String _printerNameKey = 'selected_bt_printer_name';
-  static const String _printerAddressKey = 'selected_bt_printer_address';
+static const String _printerNameKey = 'selected_bt_printer_name';
+static const String _printerAddressKey = 'selected_bt_printer_address';
 
-  static Future<List<BluetoothInfo>> getPairedPrinters() async {
-    try {
-      final enabled = await PrintBluetoothThermal.bluetoothEnabled;
+static Future<List<BluetoothInfo>> getPairedPrinters() async {
+try {
+final enabled = await PrintBluetoothThermal.bluetoothEnabled;
 
-      if (!enabled) {
-        return [];
-      }
+if (!enabled) {
+return [];
+}
 
-      return await PrintBluetoothThermal.pairedBluetooths;
-    } catch (e) {
-      debugPrint('BLUETOOTH LIST ERROR: $e');
-      return [];
-    }
-  }
+return await PrintBluetoothThermal.pairedBluetooths;
+} catch (e) {
+debugPrint('BLUETOOTH LIST ERROR: $e');
+return [];
+}
+}
 
-  static Future<bool> connect(BluetoothInfo printer) async {
-    try {
-      if (await PrintBluetoothThermal.connectionStatus) {
-        await PrintBluetoothThermal.disconnect;
-      }
+static Future<bool> connect(BluetoothInfo printer) async {
+try {
+if (await PrintBluetoothThermal.connectionStatus) {
+await PrintBluetoothThermal.disconnect;
+}
 
-      final connected = await PrintBluetoothThermal.connect(
-        macPrinterAddress: printer.macAdress,
-      );
+final connected = await PrintBluetoothThermal.connect(
+macPrinterAddress: printer.macAdress,
+);
 
-      if (connected) {
-        final prefs = await SharedPreferences.getInstance();
+if (connected) {
+final prefs = await SharedPreferences.getInstance();
 
-        await prefs.setString(
-          _printerNameKey,
-          printer.name,
-        );
+await prefs.setString(
+_printerNameKey,
+printer.name,
+);
 
-        await prefs.setString(
-          _printerAddressKey,
-          printer.macAdress,
-        );
-      }
+await prefs.setString(
+_printerAddressKey,
+printer.macAdress,
+);
+}
 
-      return connected;
-    } catch (e) {
-      debugPrint('BLUETOOTH CONNECT ERROR: $e');
-      return false;
-    }
-  }
+return connected;
+} catch (e) {
+debugPrint('BLUETOOTH CONNECT ERROR: $e');
+return false;
+}
+}
 
-  static Future<bool> disconnect() async {
-    try {
-      return await PrintBluetoothThermal.disconnect;
-    } catch (e) {
-      debugPrint('BLUETOOTH DISCONNECT ERROR: $e');
-      return false;
-    }
-  }
+static Future<bool> disconnect() async {
+try {
+return await PrintBluetoothThermal.disconnect;
+} catch (e) {
+debugPrint('BLUETOOTH DISCONNECT ERROR: $e');
+return false;
+}
+}
 
-  static Future<bool> isConnected() async {
-    try {
-      return await PrintBluetoothThermal.connectionStatus;
-    } catch (_) {
-      return false;
-    }
-  }
+static Future<bool> isConnected() async {
+try {
+return await PrintBluetoothThermal.connectionStatus;
+} catch (_) {
+return false;
+}
+}
 
-  static Future<String?> getSavedPrinterName() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_printerNameKey);
-  }
+static Future<String?> getSavedPrinterName() async {
+final prefs = await SharedPreferences.getInstance();
+return prefs.getString(_printerNameKey);
+}
 
-  static Future<String?> getSavedPrinterAddress() async {
-    final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_printerAddressKey);
-  }
+static Future<String?> getSavedPrinterAddress() async {
+final prefs = await SharedPreferences.getInstance();
+return prefs.getString(_printerAddressKey);
+}
 }
 // ============================================================
 // USB / OTG THERMAL PRINTER MANAGER
 // ============================================================
 
 class UsbPrinterManager {
-  static final unified.PrinterManager _manager =
-  unified.PrinterManager();
+static final unified.PrinterManager _manager =
+unified.PrinterManager();
 
-  static unified.UsbPrinterDevice? _connectedDevice;
+static unified.UsbPrinterDevice? _connectedDevice;
 
-  static Future<List<unified.UsbPrinterDevice>> getPrinters() async {
-    try {
-      final devices = await _manager.scanPrinters(
-        timeout: const Duration(seconds: 5),
-        types: {
-          unified.PrinterConnectionType.usb,
-        },
-      );
+static Future<List<unified.UsbPrinterDevice>> getPrinters() async {
+try {
+final devices = await _manager.scanPrinters(
+timeout: const Duration(seconds: 5),
+types: {
+unified.PrinterConnectionType.usb,
+},
+);
 
-      return devices
-          .whereType<unified.UsbPrinterDevice>()
-          .toList();
-    } catch (e) {
-      debugPrint('USB PRINTER SCAN ERROR: $e');
-      return [];
-    }
-  }
+return devices
+    .whereType<unified.UsbPrinterDevice>()
+    .toList();
+} catch (e) {
+debugPrint('USB PRINTER SCAN ERROR: $e');
+return [];
+}
+}
 
-  static Future<bool> connect(
-      unified.UsbPrinterDevice printer,
-      ) async {
-    try {
-      if (_manager.isConnected) {
-        await _manager.disconnect();
-      }
+static Future<bool> connect(
+unified.UsbPrinterDevice printer,
+) async {
+try {
+if (_manager.isConnected) {
+await _manager.disconnect();
+}
 
-      await _manager.connect(printer);
+await _manager.connect(printer);
 
-      if (_manager.isConnected) {
-        _connectedDevice = printer;
-        return true;
-      }
+if (_manager.isConnected) {
+_connectedDevice = printer;
+return true;
+}
 
-      _connectedDevice = null;
-      return false;
-    } catch (e) {
-      debugPrint('USB PRINTER CONNECT ERROR: $e');
-      _connectedDevice = null;
-      return false;
-    }
-  }
+_connectedDevice = null;
+return false;
+} catch (e) {
+debugPrint('USB PRINTER CONNECT ERROR: $e');
+_connectedDevice = null;
+return false;
+}
+}
 
-  static bool get isConnected =>
-      _manager.isConnected && _connectedDevice != null;
+static bool get isConnected =>
+_manager.isConnected && _connectedDevice != null;
 
-  static unified.UsbPrinterDevice? get connectedPrinter =>
-      _connectedDevice;
+static unified.UsbPrinterDevice? get connectedPrinter =>
+_connectedDevice;
 
-  static Future<void> printBytes(List<int> bytes) async {
-    if (!_manager.isConnected) {
-      throw Exception('USB printer connected nahi hai');
-    }
+static Future<void> printBytes(List<int> bytes) async {
+if (!_manager.isConnected) {
+throw Exception('USB printer connected nahi hai');
+}
 
-    await _manager.printBytes(bytes);
-  }
+await _manager.printBytes(bytes);
+}
 
-  static Future<void> disconnect() async {
-    await _manager.disconnect();
-    _connectedDevice = null;
-  }
+static Future<void> disconnect() async {
+await _manager.disconnect();
+_connectedDevice = null;
+}
 }
 
 // ========================= SHARE BILL / WHATSAPP ===========================
 
 String? normalizeIndianMobileNumber(String input) {
-  var digits = input.replaceAll(RegExp(r'[^0-9]'), '');
+var digits = input.replaceAll(RegExp(r'[^0-9]'), '');
 
-  if (digits.startsWith('0091') && digits.length == 14) {
-    digits = digits.substring(4);
-  } else if (digits.startsWith('091') && digits.length == 13) {
-    digits = digits.substring(3);
-  } else if (digits.startsWith('91') && digits.length == 12) {
-    digits = digits.substring(2);
-  }
+if (digits.startsWith('0091') && digits.length == 14) {
+digits = digits.substring(4);
+} else if (digits.startsWith('091') && digits.length == 13) {
+digits = digits.substring(3);
+} else if (digits.startsWith('91') && digits.length == 12) {
+digits = digits.substring(2);
+}
 
-  if (!RegExp(r'^[6-9][0-9]{9}$').hasMatch(digits)) {
-    return null;
-  }
+if (!RegExp(r'^[6-9][0-9]{9}$').hasMatch(digits)) {
+return null;
+}
 
-  return digits;
+return digits;
 }
 Future<void> shareBillWhatsApp(BuildContext context, Bill bill) async {
 final normalizedNumber =
@@ -2360,55 +2417,55 @@ content: Text('WhatsApp open nahi ho saka: $e'),
 
 
 Future<void> shareBillPdf(BuildContext context, Bill bill) async {
-  try {
-    final pdfBytes = await buildBillPdf(bill);
-    if (pdfBytes.isEmpty) {
-      throw Exception('PDF generation returned empty data');
-    }
+try {
+final pdfBytes = await buildBillPdf(bill);
+if (pdfBytes.isEmpty) {
+throw Exception('PDF generation returned empty data');
+}
 
-    final filename = 'Gurmeet_Building_Material_Bill_${bill.number}.pdf';
-    final file = XFile.fromData(
-      Uint8List.fromList(pdfBytes),
-      mimeType: 'application/pdf',
-    );
+final filename = 'Gurmeet_Building_Material_Bill_${bill.number}.pdf';
+final file = XFile.fromData(
+Uint8List.fromList(pdfBytes),
+mimeType: 'application/pdf',
+);
 
-    // IMPORTANT: do not pass text together with the PDF. Some Web Share
-    // targets (including WhatsApp) prefer the text payload and drop the file.
-    // File-only sharing gives WhatsApp/Safari the best chance to receive the
-    // actual PDF document.
-    final result = await SharePlus.instance.share(
-      ShareParams(
-        files: <XFile>[file],
-        subject: 'Bill #${bill.number}',
-        title: 'Bill #${bill.number} PDF',
-        fileNameOverrides: <String>[filename],
-        downloadFallbackEnabled: true,
-      ),
-    );
+// IMPORTANT: do not pass text together with the PDF. Some Web Share
+// targets (including WhatsApp) prefer the text payload and drop the file.
+// File-only sharing gives WhatsApp/Safari the best chance to receive the
+// actual PDF document.
+final result = await SharePlus.instance.share(
+ShareParams(
+files: <XFile>[file],
+subject: 'Bill #${bill.number}',
+title: 'Bill #${bill.number} PDF',
+fileNameOverrides: <String>[filename],
+downloadFallbackEnabled: true,
+),
+);
 
-    if (context.mounted) {
-      if (result.status == ShareResultStatus.success) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('PDF share ho gaya.')),
-        );
-      } else if (result.status == ShareResultStatus.unavailable) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('PDF download/share option open ho gaya.'),
-          ),
-        );
-      }
-    }
-  } catch (e, stackTrace) {
-    debugPrint('PDF SHARE ERROR: $e');
-    debugPrintStack(stackTrace: stackTrace);
+if (context.mounted) {
+if (result.status == ShareResultStatus.success) {
+ScaffoldMessenger.of(context).showSnackBar(
+const SnackBar(content: Text('PDF share ho gaya.')),
+);
+} else if (result.status == ShareResultStatus.unavailable) {
+ScaffoldMessenger.of(context).showSnackBar(
+const SnackBar(
+content: Text('PDF download/share option open ho gaya.'),
+),
+);
+}
+}
+} catch (e, stackTrace) {
+debugPrint('PDF SHARE ERROR: $e');
+debugPrintStack(stackTrace: stackTrace);
 
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('PDF share failed: $e')),
-      );
-    }
-  }
+if (context.mounted) {
+ScaffoldMessenger.of(context).showSnackBar(
+SnackBar(content: Text('PDF share failed: $e')),
+);
+}
+}
 }
 
 Future<void> showBillShareOptions(
@@ -2471,29 +2528,29 @@ const SizedBox(height: 12),
 // =================== PRINT BILL ================================
 
 Future<void> printBill(
-  BuildContext context,
-  Bill bill,
+BuildContext context,
+Bill bill,
 ) async {
-  try {
-    final bytes = await buildBillPdf(bill);
-    if (bytes.isEmpty) {
-      throw Exception('PDF generation returned empty data');
-    }
-    await Printing.layoutPdf(
-      name: 'Bill_${bill.number}_A4',
-      format: PdfPageFormat.a4,
-      dynamicLayout: false,
-      onLayout: (format) async => Uint8List.fromList(bytes),
-    );
-  } catch (e, stackTrace) {
-    debugPrint('A4 PRINT ERROR: $e');
-    debugPrintStack(stackTrace: stackTrace);
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Print failed: $e')),
-      );
-    }
-  }
+try {
+final bytes = await buildBillPdf(bill);
+if (bytes.isEmpty) {
+throw Exception('PDF generation returned empty data');
+}
+await Printing.layoutPdf(
+name: 'Bill_${bill.number}_A4',
+format: PdfPageFormat.a4,
+dynamicLayout: false,
+onLayout: (format) async => Uint8List.fromList(bytes),
+);
+} catch (e, stackTrace) {
+debugPrint('A4 PRINT ERROR: $e');
+debugPrintStack(stackTrace: stackTrace);
+if (context.mounted) {
+ScaffoldMessenger.of(context).showSnackBar(
+SnackBar(content: Text('Print failed: $e')),
+);
+}
+}
 }
 
 // =================== GLOBAL LOAD/REFRESH =======================
@@ -2590,20 +2647,20 @@ case SyncStatus.idle:
 return Colors.green;
 }
 }
-  double get todaysExpenses {
-    final now = DateTime.now();
+double get todaysExpenses {
+final now = DateTime.now();
 
-    return savedExpenses
-        .where(
-          (e) =>
-      e.date.year == now.year &&
-          e.date.month == now.month &&
-          e.date.day == now.day,
-    )
-        .fold(0.0, (sum, e) => sum + e.amount);
-  }
+return savedExpenses
+    .where(
+(e) =>
+e.date.year == now.year &&
+e.date.month == now.month &&
+e.date.day == now.day,
+)
+    .fold(0.0, (sum, e) => sum + e.amount);
+}
 
-  double get todaysProfit => todaySales - todaysExpenses;
+double get todaysProfit => todaySales - todaysExpenses;
 @override
 Widget build(BuildContext context) {
 final todaysBills = todayBills.take(5).toList();
@@ -2626,38 +2683,38 @@ fontSize: width < 380 ? 15 : (width < 600 ? 17 : 20),
 ),
 centerTitle: false,
 actions: [
-  IconButton(
-    tooltip: 'Bluetooth Printer',
-    icon: const Icon(Icons.print_outlined),
-    onPressed: () async {
-      await Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => const BluetoothPrinterScreen(),
-        ),
-      );
+IconButton(
+tooltip: 'Bluetooth Printer',
+icon: const Icon(Icons.print_outlined),
+onPressed: () async {
+await Navigator.push(
+context,
+MaterialPageRoute(
+builder: (_) => const BluetoothPrinterScreen(),
+),
+);
 
-      if (mounted) {
-        setState(() {});
-      }
-    },
-  ),
-  IconButton(
-    tooltip: 'USB / OTG Printer',
-    icon: const Icon(Icons.usb),
-    onPressed: () async {
-      await Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) => const UsbPrinterScreen(),
-        ),
-      );
+if (mounted) {
+setState(() {});
+}
+},
+),
+IconButton(
+tooltip: 'USB / OTG Printer',
+icon: const Icon(Icons.usb),
+onPressed: () async {
+await Navigator.push(
+context,
+MaterialPageRoute(
+builder: (_) => const UsbPrinterScreen(),
+),
+);
 
-      if (mounted) {
-        setState(() {});
-      }
-    },
-  ),
+if (mounted) {
+setState(() {});
+}
+},
+),
 IconButton(
 tooltip: 'Sync Data',
 icon: const Icon(Icons.sync),
@@ -2729,138 +2786,138 @@ padding: const EdgeInsets.all(16),
 child: Column(
 crossAxisAlignment: CrossAxisAlignment.start,
 children: [
-  Container(
-    width: double.infinity,
-    padding: const EdgeInsets.all(22),
-    decoration: BoxDecoration(
-      color: const Color(0xff253f3a),
-      borderRadius: BorderRadius.circular(20),
-    ),
-    child: Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        const Center(
-          child: Text(
-            'TOTAL',
-            style: TextStyle(
-              color: Colors.white70,
-              fontSize: 14,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ),
+Container(
+width: double.infinity,
+padding: const EdgeInsets.all(22),
+decoration: BoxDecoration(
+color: const Color(0xff253f3a),
+borderRadius: BorderRadius.circular(20),
+),
+child: Column(
+crossAxisAlignment: CrossAxisAlignment.start,
+children: [
+const Center(
+child: Text(
+'TOTAL',
+style: TextStyle(
+color: Colors.white70,
+fontSize: 14,
+fontWeight: FontWeight.w600,
+),
+),
+),
 
-        const SizedBox(height: 6),
+const SizedBox(height: 6),
 
-        Center(
-          child: Text(
-            '₹${todaySales.toStringAsFixed(2)}',
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 34,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        ),
+Center(
+child: Text(
+'₹${todaySales.toStringAsFixed(2)}',
+style: const TextStyle(
+color: Colors.white,
+fontSize: 34,
+fontWeight: FontWeight.bold,
+),
+),
+),
 
-        const SizedBox(height: 14),
+const SizedBox(height: 14),
 
-        const Divider(
-          color: Colors.white30,
-        ),
+const Divider(
+color: Colors.white30,
+),
 
-        const SizedBox(height: 8),
+const SizedBox(height: 8),
 
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            const Text(
-              "TODAY'S SALES",
-              style: TextStyle(
-                color: Colors.white70,
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            Text(
-              '₹${todaySales.toStringAsFixed(2)}',
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-        ),
+Row(
+mainAxisAlignment: MainAxisAlignment.spaceBetween,
+children: [
+const Text(
+"TODAY'S SALES",
+style: TextStyle(
+color: Colors.white70,
+fontSize: 14,
+fontWeight: FontWeight.w600,
+),
+),
+Text(
+'₹${todaySales.toStringAsFixed(2)}',
+style: const TextStyle(
+color: Colors.white,
+fontSize: 18,
+fontWeight: FontWeight.bold,
+),
+),
+],
+),
 
-        const SizedBox(height: 12),
+const SizedBox(height: 12),
 
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            const Text(
-              "TODAY'S EXPENSES",
-              style: TextStyle(
-                color: Colors.white70,
-                fontSize: 14,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            Text(
-              '₹${todaysExpenses.toStringAsFixed(2)}',
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-        ),
+Row(
+mainAxisAlignment: MainAxisAlignment.spaceBetween,
+children: [
+const Text(
+"TODAY'S EXPENSES",
+style: TextStyle(
+color: Colors.white70,
+fontSize: 14,
+fontWeight: FontWeight.w600,
+),
+),
+Text(
+'₹${todaysExpenses.toStringAsFixed(2)}',
+style: const TextStyle(
+color: Colors.white,
+fontSize: 18,
+fontWeight: FontWeight.bold,
+),
+),
+],
+),
 
-        const SizedBox(height: 10),
+const SizedBox(height: 10),
 
-        const Divider(
-          color: Colors.white30,
-        ),
+const Divider(
+color: Colors.white30,
+),
 
-        const SizedBox(height: 8),
+const SizedBox(height: 8),
 
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            const Text(
-              "TODAY'S PROFIT",
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 17,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            Text(
-              '₹${todaysProfit.toStringAsFixed(2)}',
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 22,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-        ),
+Row(
+mainAxisAlignment: MainAxisAlignment.spaceBetween,
+children: [
+const Text(
+"TODAY'S PROFIT",
+style: TextStyle(
+color: Colors.white,
+fontSize: 17,
+fontWeight: FontWeight.bold,
+),
+),
+Text(
+'₹${todaysProfit.toStringAsFixed(2)}',
+style: const TextStyle(
+color: Colors.white,
+fontSize: 22,
+fontWeight: FontWeight.bold,
+),
+),
+],
+),
 
-        const SizedBox(height: 8),
+const SizedBox(height: 8),
 
-        Center(
-          child: Text(
-            '${todayBills.length} bills today • ${_formatDate(DateTime.now())}',
-            style: const TextStyle(
-              color: Colors.white54,
-              fontSize: 12,
-            ),
-          ),
-        ),
-      ],
-    ),
-  ),
+Center(
+child: Text(
+'${todayBills.length} bills today • ${_formatDate(DateTime.now())}',
+style: const TextStyle(
+color: Colors.white54,
+fontSize: 12,
+),
+),
+),
+],
+),
+),
 
 const SizedBox(height: 18),
 SizedBox(
@@ -2892,34 +2949,34 @@ icon: const Icon(Icons.history),
 label: const Text('Bill History', style: TextStyle(fontSize: 16)),
 ),
 ),
-    const SizedBox(height: 10),
+const SizedBox(height: 10),
 
-    SizedBox(
-      width: double.infinity,
-      height: 52,
-      child: OutlinedButton.icon(
-        onPressed: () async {
-          await Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) => const ExpenseScreen(),
-            ),
-          );
+SizedBox(
+width: double.infinity,
+height: 52,
+child: OutlinedButton.icon(
+onPressed: () async {
+await Navigator.push(
+context,
+MaterialPageRoute(
+builder: (_) => const ExpenseScreen(),
+),
+);
 
-          if (mounted) {
-            setState(() {});
-          }
-        },
-        icon: const Icon(Icons.account_balance_wallet_outlined),
-        label: const Text(
-          "TODAY'S EXPENSES",
-          style: TextStyle(
-            fontSize: 16,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-      ),
-    ),
+if (mounted) {
+setState(() {});
+}
+},
+icon: const Icon(Icons.account_balance_wallet_outlined),
+label: const Text(
+"TODAY'S EXPENSES",
+style: TextStyle(
+fontSize: 16,
+fontWeight: FontWeight.bold,
+),
+),
+),
+),
 const SizedBox(height: 28),
 const Text(
 "Today's Recent Bills",
@@ -3084,22 +3141,22 @@ final List<String> units = [
 ];
 
 double get itemsTotal {
-  return items.fold(
-    0,
-        (sum, item) => sum + item.amount,
-  );
+return items.fold(
+0,
+(sum, item) => sum + item.amount,
+);
 }
 
 double get discountAmount {
-  final value = double.tryParse(
-    discountController.text.trim(),
-  ) ?? 0;
+final value = double.tryParse(
+discountController.text.trim(),
+) ?? 0;
 
-  return value.clamp(0, itemsTotal).toDouble();
+return value.clamp(0, itemsTotal).toDouble();
 }
 
 double get grandTotal {
-  return itemsTotal - discountAmount;
+return itemsTotal - discountAmount;
 }
 
 Future<void> addItem() async {
@@ -3334,7 +3391,7 @@ customerName: customerController.text.trim(),
 customerMobile: mobile,
 date: widget.editBill?.date ?? DateTime.now(),
 items: List<BillItem>.from(items),
-  discount: discountAmount,
+discount: discountAmount,
 createdAtMs: widget.editBill?.createdAtMs,
 updatedAtMs: DateTime.now().millisecondsSinceEpoch,
 deviceId: widget.editBill?.deviceId ?? '',
@@ -3707,108 +3764,108 @@ color: Colors.red,
 },
 ),
 const SizedBox(height: 15),
-  TextField(
-    controller: discountController,
-    keyboardType: const TextInputType.numberWithOptions(
-      decimal: true,
-    ),
-    onChanged: (_) => setState(() {}),
-    decoration: const InputDecoration(
-      labelText: 'Discount',
-      hintText: '20',
-      prefixText: '₹ ',
-      border: OutlineInputBorder(),
-      helperText: 'Poore bill ke total par fixed discount',
-    ),
-  ),
+TextField(
+controller: discountController,
+keyboardType: const TextInputType.numberWithOptions(
+decimal: true,
+),
+onChanged: (_) => setState(() {}),
+decoration: const InputDecoration(
+labelText: 'Discount',
+hintText: '20',
+prefixText: '₹ ',
+border: OutlineInputBorder(),
+helperText: 'Poore bill ke total par fixed discount',
+),
+),
 
-  const SizedBox(height: 15),
-  Container(
-    width: double.infinity,
-    padding: const EdgeInsets.all(20),
-    decoration: BoxDecoration(
-      color: const Color(0xff253f3a),
-      borderRadius: BorderRadius.circular(18),
-    ),
-    child: Column(
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            const Text(
-              'SUBTOTAL',
-              style: TextStyle(
-                color: Colors.white70,
-                fontSize: 16,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            Text(
-              '₹${itemsTotal.toStringAsFixed(2)}',
-              style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 17,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-          ],
-        ),
+const SizedBox(height: 15),
+Container(
+width: double.infinity,
+padding: const EdgeInsets.all(20),
+decoration: BoxDecoration(
+color: const Color(0xff253f3a),
+borderRadius: BorderRadius.circular(18),
+),
+child: Column(
+children: [
+Row(
+mainAxisAlignment: MainAxisAlignment.spaceBetween,
+children: [
+const Text(
+'SUBTOTAL',
+style: TextStyle(
+color: Colors.white70,
+fontSize: 16,
+fontWeight: FontWeight.w600,
+),
+),
+Text(
+'₹${itemsTotal.toStringAsFixed(2)}',
+style: const TextStyle(
+color: Colors.white70,
+fontSize: 17,
+fontWeight: FontWeight.w600,
+),
+),
+],
+),
 
-        if (discountAmount > 0) ...[
-          const SizedBox(height: 8),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const Text(
-                'DISCOUNT',
-                style: TextStyle(
-                  color: Colors.white70,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              Text(
-                '-₹${discountAmount.toStringAsFixed(2)}',
-                style: const TextStyle(
-                  color: Colors.white70,
-                  fontSize: 17,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-            ],
-          ),
-        ],
+if (discountAmount > 0) ...[
+const SizedBox(height: 8),
+Row(
+mainAxisAlignment: MainAxisAlignment.spaceBetween,
+children: [
+const Text(
+'DISCOUNT',
+style: TextStyle(
+color: Colors.white70,
+fontSize: 16,
+fontWeight: FontWeight.w600,
+),
+),
+Text(
+'-₹${discountAmount.toStringAsFixed(2)}',
+style: const TextStyle(
+color: Colors.white70,
+fontSize: 17,
+fontWeight: FontWeight.w600,
+),
+),
+],
+),
+],
 
-        const Divider(
-          color: Colors.white38,
-        ),
+const Divider(
+color: Colors.white38,
+),
 
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            const Text(
-              'TOTAL',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            Text(
-              '₹${grandTotal.toStringAsFixed(2)}',
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 25,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-        ),
-      ],
-    ),
-  ),
-  const SizedBox(height: 15),
-  ],
+Row(
+mainAxisAlignment: MainAxisAlignment.spaceBetween,
+children: [
+const Text(
+'TOTAL',
+style: TextStyle(
+color: Colors.white,
+fontSize: 20,
+fontWeight: FontWeight.bold,
+),
+),
+Text(
+'₹${grandTotal.toStringAsFixed(2)}',
+style: const TextStyle(
+color: Colors.white,
+fontSize: 25,
+fontWeight: FontWeight.bold,
+),
+),
+],
+),
+],
+),
+),
+const SizedBox(height: 15),
+],
 SizedBox(
 width: double.infinity,
 height: 58,
@@ -3850,676 +3907,723 @@ fontWeight: FontWeight.bold,
 }
 
 // ==================== PRODUCT CATALOG SCREEN ====================
-   Future<List<int>> buildBluetooth80mmBill(Bill bill) async {
-  final profile = await CapabilityProfile.load();
-  final generator = Generator(
-    PaperSize.mm80,
-    profile,
-  );
+Future<List<int>> buildBluetooth80mmBill(Bill bill) async {
+final profile = await CapabilityProfile.load();
 
-  final List<int> bytes = [];
+final generator = Generator(
+PaperSize.mm80,
+profile,
+);
 
-  // Header
-  bytes.addAll(
-    generator.text(
-      businessName,
-      styles: PosStyles(
-        align: PosAlign.center,
-        bold: true,
-        height: PosTextSize.size2,
-        width: PosTextSize.size2,
-      ),
-    ),
-  );
+final List<int> bytes = [];
 
-  if (businessAddress1.trim().isNotEmpty) {
-    bytes.addAll(
-      generator.text(
-        businessAddress1,
-        styles: const PosStyles(
-          align: PosAlign.center,
-        ),
-      ),
-    );
-  }
+// ================= HEADER =================
 
-  if (businessAddress2.trim().isNotEmpty) {
-    bytes.addAll(
-      generator.text(
-        businessAddress2,
-        styles: const PosStyles(
-          align: PosAlign.center,
-        ),
-      ),
-    );
-  }
+bytes.addAll(
+generator.text(
+businessName,
+styles: PosStyles(
+align: PosAlign.center,
+bold: true,
+height: PosTextSize.size2,
+width: PosTextSize.size2,
+),
+),
+);
 
-  if (businessGST.trim().isNotEmpty) {
-    bytes.addAll(
-      generator.text(
-        'GST No: $businessGST',
-        styles: const PosStyles(
-          align: PosAlign.center,
-        ),
-      ),
-    );
-  }
+if (businessAddress1.trim().isNotEmpty) {
+bytes.addAll(
+generator.text(
+businessAddress1,
+styles: const PosStyles(
+align: PosAlign.center,
+),
+),
+);
+}
 
-  if (businessContact.trim().isNotEmpty) {
-    bytes.addAll(
-      generator.text(
-        'Contact: $businessContact',
-        styles: const PosStyles(
-          align: PosAlign.center,
-        ),
-      ),
-    );
-  }
+if (businessAddress2.trim().isNotEmpty) {
+bytes.addAll(
+generator.text(
+businessAddress2,
+styles: const PosStyles(
+align: PosAlign.center,
+),
+),
+);
+}
 
-  bytes.addAll(
-    generator.text(
-      '================================================',
-      styles: const PosStyles(
-        bold: true,
-      ),
-    ),
-  );
+if (businessGST.trim().isNotEmpty) {
+bytes.addAll(
+generator.text(
+'GST No: $businessGST',
+styles: const PosStyles(
+align: PosAlign.center,
+),
+),
+);
+}
 
-  bytes.addAll(
-    generator.text(
-      'BILL',
-      styles: PosStyles(
-        align: PosAlign.center,
-        bold: true,
-        height: PosTextSize.size2,
-      ),
-    ),
-  );
-  bytes.addAll(
-    generator.text(
-      '================================================',
-      styles: const PosStyles(
-        bold: true,
-      ),
-    ),
-  );
+if (businessContact.trim().isNotEmpty) {
+bytes.addAll(
+generator.text(
+'Contact: $businessContact',
+styles: const PosStyles(
+align: PosAlign.center,
+),
+),
+);
+}
 
-  bytes.addAll(
-    generator.text(
-      'Bill No: ${bill.number}',
-    ),
-  );
+bytes.addAll(
+generator.hr(),
+);
 
-  bytes.addAll(
-    generator.text(
-      'Date: ${bill.date.day.toString().padLeft(2, '0')}/'
-          '${bill.date.month.toString().padLeft(2, '0')}/'
-          '${bill.date.year}',
-    ),
-  );
+bytes.addAll(
+generator.text(
+'BILL',
+styles: PosStyles(
+align: PosAlign.center,
+bold: true,
+height: PosTextSize.size2,
+),
+),
+);
 
-  if (bill.printCustomerDetails &&
-      bill.customerName.trim().isNotEmpty) {
-    bytes.addAll(
-      generator.text(
-        'Customer: ${bill.customerName}',
-      ),
-    );
-  }
+bytes.addAll(
+generator.hr(),
+);
 
-  if (bill.printCustomerDetails &&
-      bill.customerMobile.trim().isNotEmpty) {
-    bytes.addAll(
-      generator.text(
-        'Mobile: ${bill.customerMobile}',
-      ),
-    );
-  }
+// ================= BILL INFO =================
 
-  bytes.addAll(
-    generator.text(
-      '________________________________________________',
-      styles: const PosStyles(
-        bold: true,
-      ),
-    ),
-  );
+bytes.addAll(
+generator.text(
+'Bill No: ${bill.number}',
+),
+);
 
-// ==================== 80MM ITEM TABLE ====================
+bytes.addAll(
+generator.text(
+'Date: '
+'${bill.date.day.toString().padLeft(2, '0')}/'
+'${bill.date.month.toString().padLeft(2, '0')}/'
+'${bill.date.year}',
+),
+);
 
-     bytes.addAll(
-       generator.text(
-         'Item                    Qty      Rate       Amt',
-         styles: const PosStyles(
-           bold: true,
-         ),
-       ),
-     );
+if (bill.printCustomerDetails &&
+bill.customerName.trim().isNotEmpty) {
+bytes.addAll(
+generator.text(
+'Customer: ${bill.customerName}',
+),
+);
+}
 
-     bytes.addAll(
-       generator.text(
-         '________________________________________________',
-         styles: const PosStyles(
-           bold: true,
-         ),
-       ),
-     );
+if (bill.printCustomerDetails &&
+bill.customerMobile.trim().isNotEmpty) {
+bytes.addAll(
+generator.text(
+'Mobile: ${bill.customerMobile}',
+),
+);
+}
 
-// ALL ITEMS
-     for (final item in bill.items) {
-       String itemName = item.name.trim();
+bytes.addAll(
+generator.hr(),
+);
 
-       // 80mm printer: wider item-name space
-       if (itemName.length > 20) {
-         itemName = itemName.substring(0, 20);
-       }
+// ==========================================================
+// ITEM HEADER
+// ==========================================================
 
-       final qty = '${item.quantity.toStringAsFixed(0)} ${item.unit}'.trim();
+bytes.addAll(
+generator.row(
+[
+PosColumn(
+text: 'Item',
+width: 5,
+styles: const PosStyles(
+bold: true,
+),
+),
+PosColumn(
+text: 'Qty',
+width: 2,
+styles: const PosStyles(
+bold: true,
+align: PosAlign.right,
+),
+),
+PosColumn(
+text: 'Rate',
+width: 2,
+styles: const PosStyles(
+bold: true,
+align: PosAlign.right,
+),
+),
+PosColumn(
+text: 'Amount',
+width: 3,
+styles: const PosStyles(
+bold: true,
+align: PosAlign.right,
+),
+),
+],
+),
+);
 
-       final qtyText = qty.length > 6
-           ? qty.substring(0, 6)
-           : qty;
+bytes.addAll(
+generator.hr(),
+);
 
-       final rate = item.rate.toStringAsFixed(0);
-       final amount = item.amount.toStringAsFixed(0);
+// ==========================================================
+// ITEMS
+// ONLY ONE LOOP
+// ==========================================================
 
-       final line =
-           itemName.padRight(20) +
-               qtyText.padLeft(6) +
-               rate.padLeft(10) +
-               amount.padLeft(12);
+for (final item in bill.items) {
+var itemName = item.name.trim();
 
-       bytes.addAll(
-         generator.text(line),
-       );
-     }
+// Keep item name inside printable area.
+if (itemName.length > 18) {
+itemName = itemName.substring(0, 18);
+}
 
+var qty =
+'${item.quantity.toStringAsFixed(2)} ${item.unit}'.trim();
 
-  bytes.addAll(
-    generator.text(
-      '________________________________________________',
-      styles: const PosStyles(
-        bold: true,
-      ),
-    ),
-  );
+if (qty.length > 10) {
+qty = qty.substring(0, 10);
+}
 
+final rate =
+item.rate.toStringAsFixed(0);
 
-  // ==================== TOTALS ====================
+final amount =
+item.amount.toStringAsFixed(0);
 
-  if (bill.discount > 0) {
-    bytes.addAll(
-      generator.text(
-        'SUBTOTAL: Rs.${bill.subtotal.toStringAsFixed(2)}',
-        styles: const PosStyles(
-          align: PosAlign.right,
-        ),
-      ),
-    );
+bytes.addAll(
+generator.row(
+[
+PosColumn(
+text: itemName,
+width: 5,
+),
+PosColumn(
+text: qty,
+width: 2,
+styles: const PosStyles(
+align: PosAlign.right,
+),
+),
+PosColumn(
+text: rate,
+width: 2,
+styles: const PosStyles(
+align: PosAlign.right,
+),
+),
+PosColumn(
+text: amount,
+width: 3,
+styles: const PosStyles(
+align: PosAlign.right,
+bold: true,
+),
+),
+],
+),
+);
+}
 
-    bytes.addAll(
-      generator.text(
-        'DISCOUNT: -Rs.${bill.discount.toStringAsFixed(2)}',
-        styles: const PosStyles(
-          align: PosAlign.right,
-        ),
-      ),
-    );
-  }
+bytes.addAll(
+generator.hr(),
+);
 
-  bytes.addAll(
-    generator.text(
-      'TOTAL: Rs.${bill.total.toStringAsFixed(2)}',
-      styles: const PosStyles(
-        align: PosAlign.right,
-        bold: true,
-      ),
-    ),
-  );
+// ==========================================================
+// TOTALS
+// ==========================================================
 
+bytes.addAll(
+generator.text(
+'SUBTOTAL: Rs.${bill.subtotal.toStringAsFixed(2)}',
+styles: const PosStyles(
+align: PosAlign.right,
+),
+),
+);
 
-  bytes.addAll(generator.feed(2));
+if (bill.discount > 0) {
+bytes.addAll(
+generator.text(
+'DISCOUNT: -Rs.${bill.discount.toStringAsFixed(2)}',
+styles: const PosStyles(
+align: PosAlign.right,
+),
+),
+);
+}
 
-  bytes.addAll(
-    generator.text(
-      'THANK YOU',
-      styles: const PosStyles(
-        align: PosAlign.center,
-        bold: true,
-      ),
-    ),
-  );
-  bytes.addAll(
-    generator.text(
-      'VISIT AGAIN',
-      styles: const PosStyles(
-        align: PosAlign.center,
-      ),
-    ),
-  );
+bytes.addAll(
+generator.text(
+'TOTAL: Rs.${bill.total.toStringAsFixed(2)}',
+styles: const PosStyles(
+align: PosAlign.right,
+bold: true,
+),
+),
+);
 
+bytes.addAll(
+generator.feed(2),
+);
 
-  bytes.addAll(generator.feed(3));
+bytes.addAll(
+generator.text(
+'THANK YOU',
+styles: const PosStyles(
+align: PosAlign.center,
+bold: true,
+),
+),
+);
 
-  // Cut if printer supports it.
-  bytes.addAll(generator.cut());
+bytes.addAll(
+generator.text(
+'VISIT AGAIN',
+styles: const PosStyles(
+align: PosAlign.center,
+),
+),
+);
 
-  return bytes;
+bytes.addAll(
+generator.feed(3),
+);
+
+bytes.addAll(
+generator.cut(),
+);
+
+return bytes;
 }
 class BluetoothPrinterScreen extends StatefulWidget {
-  const BluetoothPrinterScreen({super.key});
+const BluetoothPrinterScreen({super.key});
 
-  @override
-  State<BluetoothPrinterScreen> createState() =>
-      _BluetoothPrinterScreenState();
+@override
+State<BluetoothPrinterScreen> createState() =>
+_BluetoothPrinterScreenState();
 }
 
 class _BluetoothPrinterScreenState
-    extends State<BluetoothPrinterScreen> {
-  List<BluetoothInfo> printers = [];
-  bool loading = false;
-  bool connected = false;
-  String? selectedAddress;
+extends State<BluetoothPrinterScreen> {
+List<BluetoothInfo> printers = [];
+bool loading = false;
+bool connected = false;
+String? selectedAddress;
 
-  @override
-  void initState() {
-    super.initState();
-    _loadPrinters();
-  }
+@override
+void initState() {
+super.initState();
+_loadPrinters();
+}
 
-  Future<void> _loadPrinters() async {
-    setState(() => loading = true);
+Future<void> _loadPrinters() async {
+setState(() => loading = true);
 
-    try {
-      printers =
-      await BluetoothPrinterManager.getPairedPrinters();
+try {
+printers =
+await BluetoothPrinterManager.getPairedPrinters();
 
-      selectedAddress =
-      await BluetoothPrinterManager.getSavedPrinterAddress();
+selectedAddress =
+await BluetoothPrinterManager.getSavedPrinterAddress();
 
-      connected =
-      await BluetoothPrinterManager.isConnected();
-    } catch (e) {
-      debugPrint('PRINTER SCREEN ERROR: $e');
-    }
+connected =
+await BluetoothPrinterManager.isConnected();
+} catch (e) {
+debugPrint('PRINTER SCREEN ERROR: $e');
+}
 
-    if (mounted) {
-      setState(() => loading = false);
-    }
-  }
+if (mounted) {
+setState(() => loading = false);
+}
+}
 
-  Future<void> _connect(BluetoothInfo printer) async {
-    setState(() => loading = true);
+Future<void> _connect(BluetoothInfo printer) async {
+setState(() => loading = true);
 
-    final success =
-    await BluetoothPrinterManager.connect(printer);
+final success =
+await BluetoothPrinterManager.connect(printer);
 
-    if (mounted) {
-      setState(() {
-        loading = false;
-        connected = success;
+if (mounted) {
+setState(() {
+loading = false;
+connected = success;
 
-        if (success) {
-          selectedAddress = printer.macAdress;
-        }
-      });
+if (success) {
+selectedAddress = printer.macAdress;
+}
+});
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            success
-                ? '${printer.name} connected'
-                : 'Printer connect nahi hua',
-          ),
-        ),
-      );
-    }
-  }
+ScaffoldMessenger.of(context).showSnackBar(
+SnackBar(
+content: Text(
+success
+? '${printer.name} connected'
+    : 'Printer connect nahi hua',
+),
+),
+);
+}
+}
 
-  Future<void> _disconnect() async {
-    await BluetoothPrinterManager.disconnect();
+Future<void> _disconnect() async {
+await BluetoothPrinterManager.disconnect();
 
-    if (mounted) {
-      setState(() => connected = false);
+if (mounted) {
+setState(() => connected = false);
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Printer disconnected'),
-        ),
-      );
-    }
-  }
+ScaffoldMessenger.of(context).showSnackBar(
+const SnackBar(
+content: Text('Printer disconnected'),
+),
+);
+}
+}
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text(
-          'Bluetooth Printer',
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
-        actions: [
-          IconButton(
-            tooltip: 'Refresh',
-            onPressed: loading ? null : _loadPrinters,
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
-      ),
-      body: loading && printers.isEmpty
-          ? const Center(
-        child: CircularProgressIndicator(),
-      )
-          : RefreshIndicator(
-        onRefresh: _loadPrinters,
-        child: ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(18),
-                child: Column(
-                  children: [
-                    Icon(
-                      connected
-                          ? Icons.print
-                          : Icons.print_disabled,
-                      size: 48,
-                    ),
-                    const SizedBox(height: 10),
-                    Text(
-                      connected
-                          ? 'Printer Connected'
-                          : 'No Printer Connected',
-                      style: const TextStyle(
-                        fontSize: 19,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      connected
-                          ? 'Ready to print 80mm bills'
-                          : 'Phone Bluetooth settings mein printer pair karo',
-                      textAlign: TextAlign.center,
-                    ),
-                    if (connected) ...[
-                      const SizedBox(height: 14),
-                      FilledButton.icon(
-                        onPressed: _disconnect,
-                        icon: const Icon(Icons.link_off),
-                        label: const Text('DISCONNECT'),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 18),
-            const Text(
-              'Paired Bluetooth Printers',
-              style: TextStyle(
-                fontSize: 19,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 8),
-            if (printers.isEmpty)
-              const Card(
-                child: Padding(
-                  padding: EdgeInsets.all(20),
-                  child: Text(
-                    'Koi paired Bluetooth printer nahi mila.\n\n'
-                        'Pehle Android Settings → Bluetooth mein '
-                        'printer pair karo, phir Refresh dabao.',
-                    textAlign: TextAlign.center,
-                  ),
-                ),
-              )
-            else
-              ...printers.map(
-                    (printer) {
-                  final isSelected =
-                      selectedAddress ==
-                          printer.macAdress;
+@override
+Widget build(BuildContext context) {
+return Scaffold(
+appBar: AppBar(
+title: const Text(
+'Bluetooth Printer',
+style: TextStyle(fontWeight: FontWeight.bold),
+),
+actions: [
+IconButton(
+tooltip: 'Refresh',
+onPressed: loading ? null : _loadPrinters,
+icon: const Icon(Icons.refresh),
+),
+],
+),
+body: loading && printers.isEmpty
+? const Center(
+child: CircularProgressIndicator(),
+)
+    : RefreshIndicator(
+onRefresh: _loadPrinters,
+child: ListView(
+padding: const EdgeInsets.all(16),
+children: [
+Card(
+child: Padding(
+padding: const EdgeInsets.all(18),
+child: Column(
+children: [
+Icon(
+connected
+? Icons.print
+    : Icons.print_disabled,
+size: 48,
+),
+const SizedBox(height: 10),
+Text(
+connected
+? 'Printer Connected'
+    : 'No Printer Connected',
+style: const TextStyle(
+fontSize: 19,
+fontWeight: FontWeight.bold,
+),
+),
+const SizedBox(height: 6),
+Text(
+connected
+? 'Ready to print 80mm bills'
+    : 'Phone Bluetooth settings mein printer pair karo',
+textAlign: TextAlign.center,
+),
+if (connected) ...[
+const SizedBox(height: 14),
+FilledButton.icon(
+onPressed: _disconnect,
+icon: const Icon(Icons.link_off),
+label: const Text('DISCONNECT'),
+),
+],
+],
+),
+),
+),
+const SizedBox(height: 18),
+const Text(
+'Paired Bluetooth Printers',
+style: TextStyle(
+fontSize: 19,
+fontWeight: FontWeight.bold,
+),
+),
+const SizedBox(height: 8),
+if (printers.isEmpty)
+const Card(
+child: Padding(
+padding: EdgeInsets.all(20),
+child: Text(
+'Koi paired Bluetooth printer nahi mila.\n\n'
+'Pehle Android Settings → Bluetooth mein '
+'printer pair karo, phir Refresh dabao.',
+textAlign: TextAlign.center,
+),
+),
+)
+else
+...printers.map(
+(printer) {
+final isSelected =
+selectedAddress ==
+printer.macAdress;
 
-                  return Card(
-                    child: ListTile(
-                      leading: const CircleAvatar(
-                        child: Icon(Icons.print),
-                      ),
-                      title: Text(
-                        printer.name.isEmpty
-                            ? 'Unknown Printer'
-                            : printer.name,
-                      ),
-                      subtitle: Text(
-                        printer.macAdress,
-                      ),
-                      trailing:
-                      isSelected && connected
-                          ? const Icon(
-                        Icons.check_circle,
-                        color: Colors.green,
-                      )
-                          : FilledButton(
-                        onPressed: loading
-                            ? null
-                            : () =>
-                            _connect(printer),
-                        child:
-                        const Text('CONNECT'),
-                      ),
-                    ),
-                  );
-                },
-              ),
-          ],
-        ),
-      ),
-    );
-  }
+return Card(
+child: ListTile(
+leading: const CircleAvatar(
+child: Icon(Icons.print),
+),
+title: Text(
+printer.name.isEmpty
+? 'Unknown Printer'
+    : printer.name,
+),
+subtitle: Text(
+printer.macAdress,
+),
+trailing:
+isSelected && connected
+? const Icon(
+Icons.check_circle,
+color: Colors.green,
+)
+    : FilledButton(
+onPressed: loading
+? null
+    : () =>
+_connect(printer),
+child:
+const Text('CONNECT'),
+),
+),
+);
+},
+),
+],
+),
+),
+);
+}
 }
 
 class UsbPrinterScreen extends StatefulWidget {
-  const UsbPrinterScreen({super.key});
+const UsbPrinterScreen({super.key});
 
-  @override
-  State<UsbPrinterScreen> createState() => _UsbPrinterScreenState();
+@override
+State<UsbPrinterScreen> createState() => _UsbPrinterScreenState();
 }
 
 class _UsbPrinterScreenState extends State<UsbPrinterScreen> {
-  List<unified.UsbPrinterDevice> printers = [];
-  bool loading = false;
-  bool connected = false;
+List<unified.UsbPrinterDevice> printers = [];
+bool loading = false;
+bool connected = false;
 
-  @override
-  void initState() {
-    super.initState();
-    _loadPrinters();
-  }
+@override
+void initState() {
+super.initState();
+_loadPrinters();
+}
 
-  Future<void> _loadPrinters() async {
-    if (mounted) {
-      setState(() => loading = true);
-    }
+Future<void> _loadPrinters() async {
+if (mounted) {
+setState(() => loading = true);
+}
 
-    try {
-      printers = await UsbPrinterManager.getPrinters();
-      connected = UsbPrinterManager.isConnected;
-    } catch (e) {
-      debugPrint('USB SCREEN ERROR: $e');
-    }
+try {
+printers = await UsbPrinterManager.getPrinters();
+connected = UsbPrinterManager.isConnected;
+} catch (e) {
+debugPrint('USB SCREEN ERROR: $e');
+}
 
-    if (mounted) {
-      setState(() => loading = false);
-    }
-  }
+if (mounted) {
+setState(() => loading = false);
+}
+}
 
-  Future<void> _connect(
-      unified.UsbPrinterDevice printer,
-      ) async {
-    setState(() => loading = true);
+Future<void> _connect(
+unified.UsbPrinterDevice printer,
+) async {
+setState(() => loading = true);
 
-    final success =
-    await UsbPrinterManager.connect(printer);
+final success =
+await UsbPrinterManager.connect(printer);
 
-    if (mounted) {
-      setState(() {
-        loading = false;
-        connected = success;
-      });
+if (mounted) {
+setState(() {
+loading = false;
+connected = success;
+});
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            success
-                ? '${printer.name} connected'
-                : 'USB printer connect nahi hua',
-          ),
-        ),
-      );
-    }
-  }
+ScaffoldMessenger.of(context).showSnackBar(
+SnackBar(
+content: Text(
+success
+? '${printer.name} connected'
+    : 'USB printer connect nahi hua',
+),
+),
+);
+}
+}
 
-  Future<void> _disconnect() async {
-    await UsbPrinterManager.disconnect();
+Future<void> _disconnect() async {
+await UsbPrinterManager.disconnect();
 
-    if (mounted) {
-      setState(() => connected = false);
+if (mounted) {
+setState(() => connected = false);
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('USB printer disconnected'),
-        ),
-      );
-    }
-  }
+ScaffoldMessenger.of(context).showSnackBar(
+const SnackBar(
+content: Text('USB printer disconnected'),
+),
+);
+}
+}
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text(
-          'USB / OTG Printer',
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
-        actions: [
-          IconButton(
-            tooltip: 'Refresh',
-            onPressed: loading ? null : _loadPrinters,
-            icon: const Icon(Icons.refresh),
-          ),
-        ],
-      ),
-      body: loading && printers.isEmpty
-          ? const Center(
-        child: CircularProgressIndicator(),
-      )
-          : RefreshIndicator(
-        onRefresh: _loadPrinters,
-        child: ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            Card(
-              child: Padding(
-                padding: const EdgeInsets.all(18),
-                child: Column(
-                  children: [
-                    Icon(
-                      connected
-                          ? Icons.usb
-                          : Icons.usb_off,
-                      size: 48,
-                    ),
-                    const SizedBox(height: 10),
-                    Text(
-                      connected
-                          ? 'USB Printer Connected'
-                          : 'No USB Printer Connected',
-                      style: const TextStyle(
-                        fontSize: 19,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Text(
-                      connected
-                          ? 'Ready to print 80mm bills'
-                          : 'Printer ko OTG cable se phone mein connect karo',
-                      textAlign: TextAlign.center,
-                    ),
-                    if (connected) ...[
-                      const SizedBox(height: 14),
-                      FilledButton.icon(
-                        onPressed: _disconnect,
-                        icon: const Icon(Icons.link_off),
-                        label: const Text('DISCONNECT'),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
+@override
+Widget build(BuildContext context) {
+return Scaffold(
+appBar: AppBar(
+title: const Text(
+'USB / OTG Printer',
+style: TextStyle(fontWeight: FontWeight.bold),
+),
+actions: [
+IconButton(
+tooltip: 'Refresh',
+onPressed: loading ? null : _loadPrinters,
+icon: const Icon(Icons.refresh),
+),
+],
+),
+body: loading && printers.isEmpty
+? const Center(
+child: CircularProgressIndicator(),
+)
+    : RefreshIndicator(
+onRefresh: _loadPrinters,
+child: ListView(
+padding: const EdgeInsets.all(16),
+children: [
+Card(
+child: Padding(
+padding: const EdgeInsets.all(18),
+child: Column(
+children: [
+Icon(
+connected
+? Icons.usb
+    : Icons.usb_off,
+size: 48,
+),
+const SizedBox(height: 10),
+Text(
+connected
+? 'USB Printer Connected'
+    : 'No USB Printer Connected',
+style: const TextStyle(
+fontSize: 19,
+fontWeight: FontWeight.bold,
+),
+),
+const SizedBox(height: 6),
+Text(
+connected
+? 'Ready to print 80mm bills'
+    : 'Printer ko OTG cable se phone mein connect karo',
+textAlign: TextAlign.center,
+),
+if (connected) ...[
+const SizedBox(height: 14),
+FilledButton.icon(
+onPressed: _disconnect,
+icon: const Icon(Icons.link_off),
+label: const Text('DISCONNECT'),
+),
+],
+],
+),
+),
+),
 
-            const SizedBox(height: 18),
+const SizedBox(height: 18),
 
-            const Text(
-              'USB Printers',
-              style: TextStyle(
-                fontSize: 19,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
+const Text(
+'USB Printers',
+style: TextStyle(
+fontSize: 19,
+fontWeight: FontWeight.bold,
+),
+),
 
-            const SizedBox(height: 8),
+const SizedBox(height: 8),
 
-            if (printers.isEmpty)
-              const Card(
-                child: Padding(
-                  padding: EdgeInsets.all(20),
-                  child: Text(
-                    'Koi USB printer nahi mila.\n\n'
-                        'Printer ko OTG cable se Android phone '
-                        'mein connect karo aur Refresh dabao.',
-                    textAlign: TextAlign.center,
-                  ),
-                ),
-              )
-            else
-              ...printers.map(
-                    (printer) => Card(
-                  child: ListTile(
-                    leading: const CircleAvatar(
-                      child: Icon(Icons.print),
-                    ),
-                    title: Text(
-                      printer.name.isEmpty
-                          ? 'USB Printer'
-                          : printer.name,
-                    ),
-                    subtitle: Text(
-                      printer.identifier,
-                    ),
-                    trailing: connected
-                        ? const Icon(
-                      Icons.check_circle,
-                      color: Colors.green,
-                    )
-                        : FilledButton(
-                      onPressed: loading
-                          ? null
-                          : () => _connect(printer),
-                      child: const Text('CONNECT'),
-                    ),
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
-    );
-  }
+if (printers.isEmpty)
+const Card(
+child: Padding(
+padding: EdgeInsets.all(20),
+child: Text(
+'Koi USB printer nahi mila.\n\n'
+'Printer ko OTG cable se Android phone '
+'mein connect karo aur Refresh dabao.',
+textAlign: TextAlign.center,
+),
+),
+)
+else
+...printers.map(
+(printer) => Card(
+child: ListTile(
+leading: const CircleAvatar(
+child: Icon(Icons.print),
+),
+title: Text(
+printer.name.isEmpty
+? 'USB Printer'
+    : printer.name,
+),
+subtitle: Text(
+printer.identifier,
+),
+trailing: connected
+? const Icon(
+Icons.check_circle,
+color: Colors.green,
+)
+    : FilledButton(
+onPressed: loading
+? null
+    : () => _connect(printer),
+child: const Text('CONNECT'),
+),
+),
+),
+),
+],
+),
+),
+);
+}
 }
 class ProductCatalogScreen extends StatefulWidget {
 final String categoryFilter;
@@ -5182,343 +5286,362 @@ children: groups.entries
 }
 }
 class ExpenseScreen extends StatefulWidget {
-  const ExpenseScreen({super.key});
+const ExpenseScreen({super.key});
 
-  @override
-  State<ExpenseScreen> createState() => _ExpenseScreenState();
+@override
+State<ExpenseScreen> createState() => _ExpenseScreenState();
 }
 
 class _ExpenseScreenState extends State<ExpenseScreen> {
-  final titleController = TextEditingController();
-  final amountController = TextEditingController();
-  String category = 'General';
+final titleController = TextEditingController();
+final amountController = TextEditingController();
+String category = 'General';
 
-  final categories = const [
-    'General',
-    'Transport',
-    'Labour',
-    'Electricity',
-    'Shop',
-    'Other',
-  ];
+final categories = const [
+'General',
+'Transport',
+'Labour',
+'Electricity',
+'Shop',
+'Other',
+];
 
-  bool _isSameDay(DateTime a, DateTime b) {
-    return a.year == b.year &&
-        a.month == b.month &&
-        a.day == b.day;
-  }
+bool _isSameDay(DateTime a, DateTime b) {
+return a.year == b.year &&
+a.month == b.month &&
+a.day == b.day;
+}
 
-  String _formatDate(DateTime date) {
-    return '${date.day.toString().padLeft(2, '0')}-'
-        '${date.month.toString().padLeft(2, '0')}-'
-        '${date.year}';
-  }
+String _formatDate(DateTime date) {
+return '${date.day.toString().padLeft(2, '0')}-'
+'${date.month.toString().padLeft(2, '0')}-'
+'${date.year}';
+}
 
-  double get todayTotal {
-    final now = DateTime.now();
+double get todayTotal {
+final now = DateTime.now();
 
-    return savedExpenses
-        .where((e) => _isSameDay(e.date, now))
-        .fold(0.0, (sum, e) => sum + e.amount);
-  }
+return savedExpenses
+    .where((e) => _isSameDay(e.date, now))
+    .fold(0.0, (sum, e) => sum + e.amount);
+}
 
-  Future<void> addExpense() async {
-    final title = titleController.text.trim();
-    final amount = double.tryParse(
-      amountController.text.trim(),
-    );
+Future<void> addExpense() async {
+final title = titleController.text.trim();
+final amount = double.tryParse(
+amountController.text.trim(),
+);
 
-    if (title.isEmpty || amount == null || amount <= 0) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Expense name aur valid amount enter karo'),
-        ),
-      );
-      return;
-    }
+if (title.isEmpty || amount == null || amount <= 0) {
+ScaffoldMessenger.of(context).showSnackBar(
+const SnackBar(
+content: Text('Expense name aur valid amount enter karo'),
+),
+);
+return;
+}
 
-    final now = DateTime.now();
+final now = DateTime.now();
 
-    final expense = Expense(
-      id: _newSyncId('expense'),
-      title: title,
-      category: category,
-      amount: amount,
-      date: now,
-      createdAt: now,
-      updatedAt: now,
-    );
+final expense = Expense(
+id: _newSyncId('expense'),
+title: title,
+category: category,
+amount: amount,
+date: now,
+createdAt: now,
+updatedAt: now,
+);
 
-    await CloudSync.saveExpense(expense);
+await CloudSync.saveExpense(expense);
 
-    titleController.clear();
-    amountController.clear();
+titleController.clear();
+amountController.clear();
 
-    if (mounted) {
-      setState(() {});
+if (mounted) {
+setState(() {});
 
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Expense saved successfully'),
-        ),
-      );
-    }
-  }
+ScaffoldMessenger.of(context).showSnackBar(
+const SnackBar(
+content: Text('Expense saved successfully'),
+),
+);
+}
+}
 
-  Future<void> deleteExpense(Expense expense) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Delete Expense?'),
-        content: Text(
-          '${expense.title} - ₹${expense.amount.toStringAsFixed(2)}',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('CANCEL'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: FilledButton.styleFrom(
-              backgroundColor: Colors.red,
-            ),
-            child: const Text('DELETE'),
-          ),
-        ],
-      ),
-    );
+Future<void> deleteExpense(Expense expense) async {
+final confirmed = await showDialog<bool>(
+context: context,
+builder: (context) => AlertDialog(
+title: const Text('Delete Expense?'),
+content: Text(
+'${expense.title} - ₹${expense.amount.toStringAsFixed(2)}',
+),
+actions: [
+TextButton(
+onPressed: () => Navigator.pop(context, false),
+child: const Text('CANCEL'),
+),
+FilledButton(
+onPressed: () => Navigator.pop(context, true),
+style: FilledButton.styleFrom(
+backgroundColor: Colors.red,
+),
+child: const Text('DELETE'),
+),
+],
+),
+);
 
-    if (confirmed != true) return;
+if (confirmed != true) return;
 
-    savedExpenses.removeWhere(
-          (e) => e.id == expense.id,
-    );
+// Remove locally
+savedExpenses.removeWhere(
+(e) => e.id == expense.id,
+);
 
-    notifyDataChanged();
+// Save local data
+await saveExpensesToStorage();
 
-    if (mounted) {
-      setState(() {});
-    }
-  }
+// Notify UI
+notifyDataChanged();
 
-  @override
-  void initState() {
-    super.initState();
+// Delete from Firestore
+if (CloudSync.available) {
+try {
+await CloudSync.deleteExpense(expense.id);
+} catch (e) {
+debugPrint('EXPENSE CLOUD DELETE ERROR: $e');
+}
+}
 
-    dataRevisionNotifier.addListener(_refresh);
-  }
+if (mounted) {
+setState(() {});
 
-  void _refresh() {
-    if (mounted) {
-      setState(() {});
-    }
-  }
+ScaffoldMessenger.of(context).showSnackBar(
+const SnackBar(
+content: Text('Expense deleted successfully'),
+),
+);
+}
+} // <-- YE CLOSING BRACKET IMPORTANT HAI
+@override
+void initState() {
+super.initState();
 
-  @override
-  void dispose() {
-    dataRevisionNotifier.removeListener(_refresh);
-    titleController.dispose();
-    amountController.dispose();
-    super.dispose();
-  }
+dataRevisionNotifier.addListener(_refresh);
+}
 
-  @override
-  Widget build(BuildContext context) {
-    final now = DateTime.now();
+void _refresh() {
+if (mounted) {
+setState(() {});
+}
+}
 
-    final todayExpenses = savedExpenses
-        .where((e) => _isSameDay(e.date, now))
-        .toList()
-      ..sort((a, b) => b.date.compareTo(a.date));
+@override
+void dispose() {
+dataRevisionNotifier.removeListener(_refresh);
+titleController.dispose();
+amountController.dispose();
+super.dispose();
+}
 
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text(
-          'Today Expenses',
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
-      ),
-      body: Column(
-        children: [
-          Container(
-            width: double.infinity,
-            margin: const EdgeInsets.all(16),
-            padding: const EdgeInsets.all(20),
-            decoration: BoxDecoration(
-              color: const Color(0xff253f3a),
-              borderRadius: BorderRadius.circular(18),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  "TODAY'S EXPENSES",
-                  style: TextStyle(
-                    color: Colors.white70,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  '₹${todayTotal.toStringAsFixed(2)}',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 30,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  _formatDate(now),
-                  style: const TextStyle(
-                    color: Colors.white70,
-                  ),
-                ),
-              ],
-            ),
-          ),
+@override
+Widget build(BuildContext context) {
+final now = DateTime.now();
 
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Card(
-              child: Padding(
-                padding: const EdgeInsets.all(16),
-                child: Column(
-                  children: [
-                    TextField(
-                      controller: titleController,
-                      decoration: const InputDecoration(
-                        labelText: 'Expense Name',
-                        prefixIcon: Icon(Icons.receipt_long),
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    const SizedBox(height: 10),
+final todayExpenses = savedExpenses
+    .where((e) => _isSameDay(e.date, now))
+    .toList()
+..sort((a, b) => b.date.compareTo(a.date));
 
-                    DropdownButtonFormField<String>(
-                      initialValue: category,
-                      decoration: const InputDecoration(
-                        labelText: 'Category',
-                        border: OutlineInputBorder(),
-                      ),
-                      items: categories
-                          .map(
-                            (c) => DropdownMenuItem(
-                          value: c,
-                          child: Text(c),
-                        ),
-                      )
-                          .toList(),
-                      onChanged: (value) {
-                        if (value != null) {
-                          setState(() => category = value);
-                        }
-                      },
-                    ),
+return Scaffold(
+appBar: AppBar(
+title: const Text(
+'Today Expenses',
+style: TextStyle(fontWeight: FontWeight.bold),
+),
+),
+body: Column(
+children: [
+Container(
+width: double.infinity,
+margin: const EdgeInsets.all(16),
+padding: const EdgeInsets.all(20),
+decoration: BoxDecoration(
+color: const Color(0xff253f3a),
+borderRadius: BorderRadius.circular(18),
+),
+child: Column(
+crossAxisAlignment: CrossAxisAlignment.start,
+children: [
+const Text(
+"TODAY'S EXPENSES",
+style: TextStyle(
+color: Colors.white70,
+fontWeight: FontWeight.w600,
+),
+),
+const SizedBox(height: 8),
+Text(
+'₹${todayTotal.toStringAsFixed(2)}',
+style: const TextStyle(
+color: Colors.white,
+fontSize: 30,
+fontWeight: FontWeight.bold,
+),
+),
+const SizedBox(height: 4),
+Text(
+_formatDate(now),
+style: const TextStyle(
+color: Colors.white70,
+),
+),
+],
+),
+),
 
-                    const SizedBox(height: 10),
+Padding(
+padding: const EdgeInsets.symmetric(horizontal: 16),
+child: Card(
+child: Padding(
+padding: const EdgeInsets.all(16),
+child: Column(
+children: [
+TextField(
+controller: titleController,
+decoration: const InputDecoration(
+labelText: 'Expense Name',
+prefixIcon: Icon(Icons.receipt_long),
+border: OutlineInputBorder(),
+),
+),
+const SizedBox(height: 10),
 
-                    TextField(
-                      controller: amountController,
-                      keyboardType:
-                      const TextInputType.numberWithOptions(
-                        decimal: true,
-                      ),
-                      decoration: const InputDecoration(
-                        labelText: 'Amount',
-                        prefixText: '₹ ',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
+DropdownButtonFormField<String>(
+initialValue: category,
+decoration: const InputDecoration(
+labelText: 'Category',
+border: OutlineInputBorder(),
+),
+items: categories
+    .map(
+(c) => DropdownMenuItem(
+value: c,
+child: Text(c),
+),
+)
+    .toList(),
+onChanged: (value) {
+if (value != null) {
+setState(() => category = value);
+}
+},
+),
 
-                    const SizedBox(height: 12),
+const SizedBox(height: 10),
 
-                    SizedBox(
-                      width: double.infinity,
-                      height: 52,
-                      child: FilledButton.icon(
-                        onPressed: addExpense,
-                        icon: const Icon(Icons.add),
-                        label: const Text(
-                          'ADD EXPENSE',
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
+TextField(
+controller: amountController,
+keyboardType:
+const TextInputType.numberWithOptions(
+decimal: true,
+),
+decoration: const InputDecoration(
+labelText: 'Amount',
+prefixText: '₹ ',
+border: OutlineInputBorder(),
+),
+),
 
-          const SizedBox(height: 10),
+const SizedBox(height: 12),
 
-          Expanded(
-            child: todayExpenses.isEmpty
-                ? const Center(
-              child: Text(
-                'No expenses today',
-                style: TextStyle(
-                  color: Colors.grey,
-                  fontSize: 17,
-                ),
-              ),
-            )
-                : ListView.builder(
-              padding: const EdgeInsets.fromLTRB(
-                16,
-                0,
-                16,
-                20,
-              ),
-              itemCount: todayExpenses.length,
-              itemBuilder: (context, index) {
-                final expense = todayExpenses[index];
+SizedBox(
+width: double.infinity,
+height: 52,
+child: FilledButton.icon(
+onPressed: addExpense,
+icon: const Icon(Icons.add),
+label: const Text(
+'ADD EXPENSE',
+style: TextStyle(
+fontWeight: FontWeight.bold,
+),
+),
+),
+),
+],
+),
+),
+),
+),
 
-                return Card(
-                  child: ListTile(
-                    leading: const CircleAvatar(
-                      child: Icon(Icons.money_off),
-                    ),
-                    title: Text(
-                      expense.title,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    subtitle: Text(
-                      '${expense.category} • '
-                          '${_formatDate(expense.date)}',
-                    ),
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          '₹${expense.amount.toStringAsFixed(2)}',
-                          style: const TextStyle(
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        IconButton(
-                          icon: const Icon(
-                            Icons.delete_outline,
-                            color: Colors.red,
-                          ),
-                          onPressed: () =>
-                              deleteExpense(expense),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+const SizedBox(height: 10),
+
+Expanded(
+child: todayExpenses.isEmpty
+? const Center(
+child: Text(
+'No expenses today',
+style: TextStyle(
+color: Colors.grey,
+fontSize: 17,
+),
+),
+)
+    : ListView.builder(
+padding: const EdgeInsets.fromLTRB(
+16,
+0,
+16,
+20,
+),
+itemCount: todayExpenses.length,
+itemBuilder: (context, index) {
+final expense = todayExpenses[index];
+
+return Card(
+child: ListTile(
+leading: const CircleAvatar(
+child: Icon(Icons.money_off),
+),
+title: Text(
+expense.title,
+style: const TextStyle(
+fontWeight: FontWeight.bold,
+),
+),
+subtitle: Text(
+'${expense.category} • '
+'${_formatDate(expense.date)}',
+),
+trailing: Row(
+mainAxisSize: MainAxisSize.min,
+children: [
+Text(
+'₹${expense.amount.toStringAsFixed(2)}',
+style: const TextStyle(
+fontWeight: FontWeight.bold,
+),
+),
+IconButton(
+icon: const Icon(
+Icons.delete_outline,
+color: Colors.red,
+),
+onPressed: () =>
+deleteExpense(expense),
+),
+],
+),
+),
+);
+},
+),
+),
+],
+),
+);
+}
 }
